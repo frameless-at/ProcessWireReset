@@ -162,8 +162,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// ── Phase 2: Database reset ──────────────────────────────────────
 
 		$this->dropAllTables($database);
-		$this->importSqlFile($database, $coreInstallSql);
-		$this->importSqlFile($database, $profileInstallSql);
+		$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config);
 		$this->restoreSuperuser($database, $superuser, $config);
 		$this->restoreModules($database, $keptModuleData);
 
@@ -304,34 +303,51 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 *
 	 * Handles WireDatabaseBackup header lines and SQL comments.
 	 *
+	 * Uses WireDatabaseBackup::restoreMerge() — the same method the PW installer
+	 * uses. This correctly merges data from both files: core provides base data
+	 * (permissions, roles, passwords) while the profile adds content data.
+	 * Sequential import would fail because the profile's DROP TABLE statements
+	 * destroy the core's data.
+	 *
 	 * @param WireDatabasePDO $database
-	 * @param string $file Absolute path to .sql file
+	 * @param string $coreFile Path to wire/core/install.sql
+	 * @param string $profileFile Path to profile install.sql
+	 * @param Config $config
 	 * @throws WireException
 	 */
-	protected function importSqlFile($database, $file) {
-		$content = file_get_contents($file);
-		if ($content === false) {
-			throw new WireException("Cannot read SQL file: $file");
+	protected function importSqlMerged($database, $coreFile, $profileFile, $config) {
+		$backupClass = $config->paths->wire . 'core/WireDatabaseBackup.php';
+		if (!class_exists('\ProcessWire\WireDatabaseBackup', false)) {
+			require_once $backupClass;
 		}
 
-		$statement = '';
-		foreach (explode("\n", $content) as $line) {
-			$trimmed = trim($line);
+		$backup = new WireDatabaseBackup();
+		$backup->setDatabase($database);
 
-			// Skip WireDatabaseBackup header
-			if (strpos($trimmed, '--- WireDatabaseBackup') === 0) continue;
-			// Skip SQL comments and empty lines
-			if ($trimmed === '' || strpos($trimmed, '--') === 0) continue;
+		$restoreOptions = [];
+		$dbEngine = $config->dbEngine ?: 'InnoDB';
+		$dbCharset = $config->dbCharset ?: 'utf8';
 
-			$statement .= $line . "\n";
+		$replace = [];
+		$replace['ENGINE=InnoDB'] = "ENGINE=$dbEngine";
+		$replace['ENGINE=MyISAM'] = "ENGINE=$dbEngine";
+		$replace['CHARSET=utf8mb4;'] = "CHARSET=$dbCharset;";
+		$replace['CHARSET=utf8;'] = "CHARSET=$dbCharset;";
 
-			if (substr($trimmed, -1) === ';') {
-				$sql = trim($statement);
-				if ($sql !== '' && $sql !== ';') {
-					$database->exec($sql);
-				}
-				$statement = '';
+		if (strtolower($dbCharset) === 'utf8mb4') {
+			if (strtolower($dbEngine) === 'innodb') {
+				$replace['(255)'] = '(191)';
+				$replace['(250)'] = '(191)';
+			} else {
+				$replace['(255)'] = '(250)';
 			}
+		}
+
+		$restoreOptions['findReplaceCreateTable'] = $replace;
+
+		if (!$backup->restoreMerge($coreFile, $profileFile, $restoreOptions)) {
+			$errors = $backup->errors();
+			throw new WireException("SQL import failed: " . implode(', ', $errors));
 		}
 	}
 
