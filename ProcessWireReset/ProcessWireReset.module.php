@@ -169,6 +169,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		// ── Phase 3: Filesystem reset ────────────────────────────────────
 
+		// Disable autoloaded debug tools and suppress errors from their
+		// shutdown handlers — module files are about to be deleted.
+		$this->silenceAutoloadModules();
+
 		$sitePath = $config->paths->site;
 
 		$this->emptyDirectory($sitePath . 'assets/files/');
@@ -194,9 +198,17 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// ── Phase 4: Redirect to login ───────────────────────────────────
 
 		$adminUrl = $config->urls->admin;
-		echo "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0;url=$adminUrl'>"
-			. "</head><body><p>Reset complete. <a href='$adminUrl'>Click here</a> if not redirected.</p>"
-			. "</body></html>";
+
+		// Send redirect and close connection before shutdown handlers fire
+		header("Location: $adminUrl");
+		header("Connection: close");
+		header("Content-Length: 0");
+		if (function_exists('fastcgi_finish_request')) {
+			fastcgi_finish_request();
+		} else {
+			while (ob_get_level() > 0) ob_end_clean();
+			flush();
+		}
 		exit;
 	}
 
@@ -392,6 +404,31 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				':flags' => $moduleData['flags'],
 				':data' => $moduleData['data'],
 			]);
+		}
+	}
+
+	/**
+	 * Disable autoloaded debug tools and suppress errors
+	 *
+	 * Autoload modules like TracyDebugger register PHP shutdown handlers.
+	 * When we delete their files, those handlers fail fatally on exit.
+	 * This method disables known debug tools and suppresses all error
+	 * output so shutdown handlers of deleted modules fail silently.
+	 */
+	protected function silenceAutoloadModules() {
+		// Suppress all error output from this point on
+		error_reporting(0);
+		ini_set('display_errors', '0');
+
+		// Disable TracyDebugger specifically if loaded
+		if (class_exists('\Tracy\Debugger', false)) {
+			\Tracy\Debugger::$showBar = false;
+			\Tracy\Debugger::enable(\Tracy\Debugger::ProductionMode);
+		}
+
+		// Clear output buffers registered by debug tools
+		while (ob_get_level() > 0) {
+			ob_end_clean();
 		}
 	}
 
