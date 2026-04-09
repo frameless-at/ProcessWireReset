@@ -381,6 +381,55 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			"INSERT INTO field_roles (pages_id, data, sort) VALUES (:id, :role, 0)"
 		);
 		$stmt->execute([':id' => $guestUserId, ':role' => $guestUserRoleId]);
+
+		// Restore essential permissions (field_permissions is empty after import
+		// because it's in the install.sql excludeExportTables list)
+		$this->restorePermissions($database, $config);
+	}
+
+	/**
+	 * Restore default permission assignments for roles
+	 *
+	 * The install.sql excludes field_permissions data, so we must manually
+	 * assign permissions that PW needs to function. Without page-view on the
+	 * guest role, PW cannot serve any page — not even the login screen.
+	 *
+	 * @param WireDatabasePDO $database
+	 * @param Config $config
+	 */
+	protected function restorePermissions($database, $config) {
+		$guestRoleId = (int) $config->guestUserRolePageID;     // 37
+		$superUserRoleId = (int) $config->superUserRolePageID; // 38
+
+		// Permission page IDs (from default install.sql pages table)
+		$permissions = [
+			'page-view'     => 36,
+			'page-edit'     => 32,
+			'page-delete'   => 34,
+			'page-move'     => 35,
+			'page-sort'     => 50,
+			'page-template' => 51,
+			'user-admin'    => 52,
+			'profile-edit'  => 53,
+			'page-lock'     => 54,
+			'page-lister'   => 1006,
+		];
+
+		// Guest role: page-view is essential for PW to serve any page
+		$stmt = $database->prepare(
+			"INSERT INTO field_permissions (pages_id, data, sort) VALUES (:role, :perm, 0)"
+		);
+		$stmt->execute([':role' => $guestRoleId, ':perm' => $permissions['page-view']]);
+
+		// Superuser role bypasses permission checks in PW, but assign all
+		// permissions explicitly for API consistency and edge cases
+		$sort = 0;
+		foreach ($permissions as $permId) {
+			$stmt = $database->prepare(
+				"INSERT INTO field_permissions (pages_id, data, sort) VALUES (:role, :perm, :sort)"
+			);
+			$stmt->execute([':role' => $superUserRoleId, ':perm' => $permId, ':sort' => $sort++]);
+		}
 	}
 
 	/**
