@@ -10,47 +10,32 @@
  * DELETE THIS FILE AFTER USE.
  */
 
-namespace ProcessWire;
-
-// Load PW config to get DB credentials
+// Extract DB credentials from site/config.php via regex (avoids executing the file)
 $configFile = __DIR__ . '/site/config.php';
 if (!file_exists($configFile)) {
     die("Error: site/config.php not found. Place this file in your ProcessWire root directory.");
 }
 
-// Define PROCESSWIRE constant that config.php requires
-define('PROCESSWIRE', true);
+$configContent = file_get_contents($configFile);
 
-// We need to parse the config file to get DB credentials
-// Create a minimal Config object
-$config = new \stdClass();
-$config->dbHost = '';
-$config->dbName = '';
-$config->dbUser = '';
-$config->dbPass = '';
-$config->dbPort = '3306';
-$config->dbCharset = 'utf8';
-$config->useFunctionsAPI = false;
-$config->usePageClasses = false;
-$config->useMarkupRegions = false;
-$config->prependTemplateFile = '';
-$config->appendTemplateFile = '';
-$config->templateCompile = false;
-$config->debug = false;
-$config->dbEngine = 'InnoDB';
+$dbHost = ''; $dbName = ''; $dbUser = ''; $dbPass = ''; $dbPort = '3306'; $dbCharset = 'utf8';
 
-// Include config to get DB settings
-include $configFile;
+if (preg_match('/\$config\s*->\s*dbHost\s*=\s*[\'"](.+?)[\'"]\s*;/', $configContent, $m)) $dbHost = $m[1];
+if (preg_match('/\$config\s*->\s*dbName\s*=\s*[\'"](.+?)[\'"]\s*;/', $configContent, $m)) $dbName = $m[1];
+if (preg_match('/\$config\s*->\s*dbUser\s*=\s*[\'"](.+?)[\'"]\s*;/', $configContent, $m)) $dbUser = $m[1];
+if (preg_match('/\$config\s*->\s*dbPass\s*=\s*[\'"](.+?)[\'"]\s*;/', $configContent, $m)) $dbPass = $m[1];
+if (preg_match('/\$config\s*->\s*dbPort\s*=\s*[\'"]?(\d+)[\'"]?\s*;/', $configContent, $m)) $dbPort = $m[1];
+if (preg_match('/\$config\s*->\s*dbCharset\s*=\s*[\'"](.+?)[\'"]\s*;/', $configContent, $m)) $dbCharset = $m[1];
 
-if (empty($config->dbName) || empty($config->dbUser)) {
-    die("Error: Could not read database credentials from site/config.php");
+if (empty($dbName) || empty($dbUser)) {
+    die("Error: Could not parse database credentials from site/config.php");
 }
 
 // Connect to database
 try {
-    $dsn = "mysql:host={$config->dbHost};port={$config->dbPort};dbname={$config->dbName};charset={$config->dbCharset}";
-    $pdo = new \PDO($dsn, $config->dbUser, $config->dbPass, [
-        \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+    $dsn = "mysql:host=$dbHost;port=$dbPort;dbname=$dbName;charset=$dbCharset";
+    $pdo = new PDO($dsn, $dbUser, $dbPass, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
     ]);
 } catch (\PDOException $e) {
     die("Database connection failed: " . $e->getMessage());
