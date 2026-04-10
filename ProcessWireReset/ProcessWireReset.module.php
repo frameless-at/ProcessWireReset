@@ -149,6 +149,23 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		$database = $this->wire('database');
 		$config = $this->wire('config');
+		$input = $this->wire('input');
+
+		// Read current form selection from POST (not yet saved to $data)
+		$postProfilePath = $input->post('profilePath');
+		if ($postProfilePath !== null) {
+			$data['profilePath'] = (string) $postProfilePath;
+		}
+		$postKeepModules = $input->post('keepModules');
+		if ($postKeepModules !== null) {
+			if (is_array($postKeepModules)) {
+				$data['keepModules'] = $postKeepModules;
+			} else {
+				$data['keepModules'] = array_values(array_filter(
+					array_map('trim', explode(',', (string) $postKeepModules))
+				));
+			}
+		}
 
 		// ── Phase 1: Gather data before destroying anything ──────────────
 
@@ -174,12 +191,22 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$keptModuleData = $this->backupModuleData($database, $data);
 		$profileTemplatesPath = $this->resolveProfileTemplatesPath($data);
 
+		// Back up custom tables (any table not defined in install.sql) —
+		// these typically belong to modules that create their own storage
+		// (e.g. login throttle, logs, custom module caches).
+		$customTables = [];
+		if (!empty($data['keepModules'])) {
+			$canonicalTables = $this->getCanonicalTables($coreInstallSql, $profileInstallSql);
+			$customTables = $this->backupCustomTables($database, $canonicalTables);
+		}
+
 		// ── Phase 2: Database reset ──────────────────────────────────────
 
 		$this->dropAllTables($database);
 		$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config);
 		$this->restoreSuperuser($database, $superuser, $config);
 		$this->restoreModules($database, $keptModuleData);
+		$this->restoreCustomTables($database, $customTables);
 
 		// ── Phase 3: Filesystem reset ────────────────────────────────────
 
@@ -319,6 +346,116 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		} catch (\Exception $e) {
 			return '';
 		}
+	}
+
+	/**
+	 * Parse install.sql files and return all CREATE TABLE names
+	 *
+	 * These are the "canonical" tables that restoreMerge will recreate.
+	 * Any table in the live DB that is NOT in this list is considered
+	 * custom (typically belonging to modules that create their own tables).
+	 *
+	 * @param string ...$files One or more SQL file paths
+	 * @return array Map of table_name => true
+	 */
+	protected function getCanonicalTables(...$files) {
+		$tables = [];
+		foreach ($files as $file) {
+			$content = @file_get_contents($file);
+			if ($content === false) continue;
+			if (preg_match_all('/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i', $content, $matches)) {
+				foreach ($matches[1] as $tableName) {
+					$tables[$tableName] = true;
+				}
+			}
+		}
+		return $tables;
+	}
+
+	/**
+	 * Back up all tables not present in the install.sql files
+	 *
+	 * Dumps structure (CREATE TABLE) and all rows so they can be
+	 * recreated after the reset.
+	 *
+	 * @param WireDatabasePDO $database
+	 * @param array $canonicalTables Map of table_name => true from getCanonicalTables
+	 * @return array Array of [table => ['create' => ..., 'rows' => [...]]]
+	 */
+	protected function backupCustomTables($database, array $canonicalTables) {
+		$backup = [];
+		$allTables = $database->query("SHOW TABLES")->fetchAll(\PDO::FETCH_COLUMN);
+
+		foreach ($allTables as $table) {
+			if (isset($canonicalTables[$table])) continue;
+
+			$createSql = $this->getCreateTable($database, $table);
+			if (empty($createSql)) continue;
+
+			$safeTable = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
+			$rows = [];
+			try {
+				$stmt = $database->query("SELECT * FROM `$safeTable`");
+				$rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+			} catch (\Exception $e) {
+				// Skip tables we can't read
+				continue;
+			}
+
+			$backup[$safeTable] = [
+				'create' => $createSql,
+				'rows' => $rows,
+			];
+		}
+
+		return $backup;
+	}
+
+	/**
+	 * Restore backed-up custom tables after the DB reset
+	 *
+	 * Recreates each table with its original CREATE TABLE statement and
+	 * re-inserts all rows. Uses FOREIGN_KEY_CHECKS=0 to avoid FK issues
+	 * with data that may reference freshly-imported canonical tables.
+	 *
+	 * @param WireDatabasePDO $database
+	 * @param array $customTables Output of backupCustomTables()
+	 */
+	protected function restoreCustomTables($database, array $customTables) {
+		if (empty($customTables)) return;
+
+		$database->exec("SET FOREIGN_KEY_CHECKS = 0");
+
+		foreach ($customTables as $table => $tableData) {
+			$database->exec("DROP TABLE IF EXISTS `$table`");
+			$database->exec($tableData['create']);
+
+			foreach ($tableData['rows'] as $row) {
+				if (empty($row)) continue;
+
+				$cols = array_keys($row);
+				$colsSql = '`' . implode('`,`', $cols) . '`';
+				$placeholders = [];
+				$bindParams = [];
+				foreach ($cols as $i => $col) {
+					$ph = ':v' . $i;
+					$placeholders[] = $ph;
+					$bindParams[$ph] = $row[$col];
+				}
+				$phSql = implode(',', $placeholders);
+
+				try {
+					$stmt = $database->prepare(
+						"INSERT INTO `$table` ($colsSql) VALUES ($phSql)"
+					);
+					$stmt->execute($bindParams);
+				} catch (\Exception $e) {
+					// Continue on row errors — don't fail the whole table
+				}
+			}
+		}
+
+		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
 	}
 
 	/**
