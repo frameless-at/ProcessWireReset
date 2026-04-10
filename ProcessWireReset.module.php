@@ -71,6 +71,15 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		if (!is_array($pending) || empty($pending)) return;
 
+		// Index pending by class name
+		$byClass = [];
+		foreach ($pending as $item) {
+			if (!empty($item['class']) && $item['class'] !== $this->className()) {
+				$byClass[$item['class']] = $item;
+			}
+		}
+		if (empty($byClass)) return;
+
 		$modules = $this->wire('modules');
 		$database = $this->wire('database');
 		$config = $this->wire('config');
@@ -86,17 +95,57 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// Refresh modules cache so PW rediscovers module files
 		$modules->refresh();
 
-		foreach ($pending as $item) {
-			$className = isset($item['class']) ? $item['class'] : '';
-			if (empty($className) || $className === $this->className()) continue;
+		// Multi-pass install: if a module fails because its dependency isn't
+		// ready yet, retry in a later pass. Handles duplicate-entry errors as
+		// success (PW may have auto-installed a dependency already).
+		$remaining = array_keys($byClass);
+		$installed = [];
+		$failed = [];
+		$maxPasses = count($remaining) + 2;
 
-			try {
-				if (!$modules->isInstalled($className)) {
-					$modules->install($className);
-					$log->save('processwirereset', "Re-installed module: $className");
+		for ($pass = 0; $pass < $maxPasses && !empty($remaining); $pass++) {
+			$nextRemaining = [];
+			$progress = false;
+
+			foreach ($remaining as $className) {
+				// Check DB directly (bypasses PW's possibly-stale cache)
+				$stmt = $database->prepare("SELECT id FROM modules WHERE class = :class");
+				$stmt->execute([':class' => $className]);
+				if ($stmt->fetch()) {
+					$installed[$className] = true;
+					$progress = true;
+					continue;
 				}
 
-				// Restore backed-up config/flags
+				try {
+					$modules->install($className);
+					$modules->refresh();
+					$installed[$className] = true;
+					$progress = true;
+				} catch (\Exception $e) {
+					$msg = $e->getMessage();
+					// Duplicate entry means the module was auto-installed as
+					// a dependency during a sibling's install(). Treat as success.
+					if (stripos($msg, 'Duplicate entry') !== false) {
+						$installed[$className] = true;
+						$progress = true;
+						$modules->refresh();
+					} else {
+						// Retry in next pass — a dependency may get installed meanwhile
+						$nextRemaining[] = $className;
+						$failed[$className] = $msg;
+					}
+				}
+			}
+
+			$remaining = $nextRemaining;
+			if (!$progress) break; // no progress, give up
+		}
+
+		// Restore config/flags for ALL modules from the pending list that
+		// ended up in the DB (including deps auto-installed by PW).
+		foreach ($byClass as $className => $item) {
+			try {
 				$stmt = $database->prepare(
 					"UPDATE modules SET data = :data, flags = :flags WHERE class = :class"
 				);
@@ -106,8 +155,17 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 					':class' => $className,
 				]);
 			} catch (\Exception $e) {
-				$log->save('processwirereset', "Failed to install $className: " . $e->getMessage());
+				$log->save('processwirereset', "Failed to restore config for $className: " . $e->getMessage());
 			}
+		}
+
+		// Log summary
+		if (!empty($installed)) {
+			$log->save('processwirereset', "Re-installed kept modules: " . implode(', ', array_keys($installed)));
+		}
+		foreach ($remaining as $className) {
+			$reason = isset($failed[$className]) ? $failed[$className] : 'unknown';
+			$log->save('processwirereset', "Failed to install kept module $className: $reason");
 		}
 
 		// Restore user context
