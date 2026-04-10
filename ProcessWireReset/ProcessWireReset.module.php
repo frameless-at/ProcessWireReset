@@ -369,23 +369,25 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Restore the superuser account into the freshly imported database
 	 *
+	 * The core install.sql (imported via restoreMerge) already populates
+	 * field_pass, field_email, field_roles, and field_permissions with
+	 * empty defaults for users 40 and 41. We only need to UPDATE the
+	 * existing entries with the backed-up credentials.
+	 *
 	 * @param WireDatabasePDO $database
 	 * @param array $superuser Backed-up superuser data
 	 * @param Config $config
 	 */
 	protected function restoreSuperuser($database, array $superuser, $config) {
 		$id = (int) $superuser['id'];
-		$superUserRoleId = (int) $config->superUserRolePageID;
-		$guestUserRoleId = (int) $config->guestUserRolePageID;
-		$guestUserId = (int) $config->guestUserPageID;
 
 		// Update admin page name to match original superuser
 		$stmt = $database->prepare("UPDATE pages SET name = :name WHERE id = :id");
 		$stmt->execute([':name' => $superuser['name'], ':id' => $id]);
 
-		// Restore password
+		// Update password (core install.sql created an empty entry)
 		$stmt = $database->prepare(
-			"INSERT INTO field_pass (pages_id, data, salt) VALUES (:id, :data, :salt)"
+			"UPDATE field_pass SET data = :data, salt = :salt WHERE pages_id = :id"
 		);
 		$stmt->execute([
 			':id' => $id,
@@ -393,74 +395,17 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			':salt' => $superuser['pass_salt'],
 		]);
 
-		// Restore email
+		// Update email (core install.sql created an empty entry)
 		if (!empty($superuser['email'])) {
 			$stmt = $database->prepare(
-				"INSERT INTO field_email (pages_id, data) VALUES (:id, :data)"
+				"UPDATE field_email SET data = :data WHERE pages_id = :id"
 			);
 			$stmt->execute([':id' => $id, ':data' => $superuser['email']]);
 		}
 
-		// Assign superuser role
-		$stmt = $database->prepare(
-			"INSERT INTO field_roles (pages_id, data, sort) VALUES (:id, :role, 0)"
-		);
-		$stmt->execute([':id' => $id, ':role' => $superUserRoleId]);
-
-		// Assign guest role to guest user
-		$stmt = $database->prepare(
-			"INSERT INTO field_roles (pages_id, data, sort) VALUES (:id, :role, 0)"
-		);
-		$stmt->execute([':id' => $guestUserId, ':role' => $guestUserRoleId]);
-
-		// Restore essential permissions (field_permissions is empty after import
-		// because it's in the install.sql excludeExportTables list)
-		$this->restorePermissions($database, $config);
-	}
-
-	/**
-	 * Restore default permission assignments for roles
-	 *
-	 * The install.sql excludes field_permissions data, so we must manually
-	 * assign permissions that PW needs to function. Without page-view on the
-	 * guest role, PW cannot serve any page — not even the login screen.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @param Config $config
-	 */
-	protected function restorePermissions($database, $config) {
-		$guestRoleId = (int) $config->guestUserRolePageID;     // 37
-		$superUserRoleId = (int) $config->superUserRolePageID; // 38
-
-		// Permission page IDs (from default install.sql pages table)
-		$permissions = [
-			'page-view'     => 36,
-			'page-edit'     => 32,
-			'page-delete'   => 34,
-			'page-move'     => 35,
-			'page-sort'     => 50,
-			'page-template' => 51,
-			'user-admin'    => 52,
-			'profile-edit'  => 53,
-			'page-lock'     => 54,
-			'page-lister'   => 1006,
-		];
-
-		// Guest role: page-view is essential for PW to serve any page
-		$stmt = $database->prepare(
-			"INSERT INTO field_permissions (pages_id, data, sort) VALUES (:role, :perm, 0)"
-		);
-		$stmt->execute([':role' => $guestRoleId, ':perm' => $permissions['page-view']]);
-
-		// Superuser role bypasses permission checks in PW, but assign all
-		// permissions explicitly for API consistency and edge cases
-		$sort = 0;
-		foreach ($permissions as $permId) {
-			$stmt = $database->prepare(
-				"INSERT INTO field_permissions (pages_id, data, sort) VALUES (:role, :perm, :sort)"
-			);
-			$stmt->execute([':role' => $superUserRoleId, ':perm' => $permId, ':sort' => $sort++]);
-		}
+		// Roles and permissions are already set up by the core install.sql:
+		//   field_roles: user 41 gets guest + superuser roles
+		//   field_permissions: full default assignments for both roles
 	}
 
 	/**
