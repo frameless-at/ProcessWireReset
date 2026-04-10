@@ -13,6 +13,21 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 	const CONFIRM_TEXT = 'RESET';
 
+	public static function getModuleInfo() {
+		return [
+			'title' => 'ProcessWire Reset',
+			'version' => '0.0.1',
+			'summary' => 'Resets a ProcessWire installation to a clean profile state while preserving the current superuser and selected modules.',
+			'author' => 'frameless',
+			'icon' => 'refresh',
+			'singular' => true,
+			'autoload' => false,
+			'requires' => [
+				'ProcessWire>=3.0.0',
+			],
+		];
+	}
+
 	public function __construct() {
 		parent::__construct();
 		$this->set('profilePath', '');
