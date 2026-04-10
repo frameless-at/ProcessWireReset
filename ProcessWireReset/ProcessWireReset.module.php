@@ -254,12 +254,20 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$stmt->execute([':id' => $userId]);
 			$email = $stmt->fetch(\PDO::FETCH_ASSOC);
 
+			// Capture current schemas for field_pass and field_email to
+			// preserve any column size upgrades applied by SystemUpdater
+			// or third-party modules (modern PW hashes can exceed char(40))
+			$passSchema = $this->getCreateTable($database, 'field_pass');
+			$emailSchema = $this->getCreateTable($database, 'field_email');
+
 			return [
 				'id' => $userId,
 				'name' => $page['name'],
-				'pass_data' => $pass ? $pass['data'] : '',
-				'pass_salt' => $pass ? $pass['salt'] : '',
+				'pass_data' => $pass ? rtrim($pass['data']) : '',
+				'pass_salt' => $pass ? rtrim($pass['salt']) : '',
 				'email' => $email ? $email['data'] : '',
+				'pass_schema' => $passSchema,
+				'email_schema' => $emailSchema,
 			];
 		} catch (\Exception $e) {
 			return null;
@@ -294,6 +302,23 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		}
 
 		return $result;
+	}
+
+	/**
+	 * Get the CREATE TABLE statement for a given table
+	 *
+	 * @param WireDatabasePDO $database
+	 * @param string $table Table name (must be validated)
+	 * @return string CREATE TABLE statement or empty string on failure
+	 */
+	protected function getCreateTable($database, $table) {
+		$table = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
+		try {
+			$row = $database->query("SHOW CREATE TABLE `$table`")->fetch(\PDO::FETCH_NUM);
+			return $row ? $row[1] : '';
+		} catch (\Exception $e) {
+			return '';
+		}
 	}
 
 	/**
@@ -381,13 +406,29 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	protected function restoreSuperuser($database, array $superuser, $config) {
 		$id = (int) $superuser['id'];
 
+		// Restore original field_pass/field_email schemas to prevent hash
+		// truncation if the live installation had larger columns than the
+		// default char(40)/char(32) (e.g. from PW upgrades over time).
+		// We drop the freshly imported tables and recreate with the original
+		// schemas, then re-insert the guest user defaults the core sql expects.
+		if (!empty($superuser['pass_schema'])) {
+			$database->exec("DROP TABLE IF EXISTS `field_pass`");
+			$database->exec($superuser['pass_schema']);
+			// Re-insert guest user default (core install.sql had this)
+			$database->exec("INSERT INTO field_pass (pages_id, data, salt) VALUES (40, '', '')");
+		}
+		if (!empty($superuser['email_schema'])) {
+			$database->exec("DROP TABLE IF EXISTS `field_email`");
+			$database->exec($superuser['email_schema']);
+		}
+
 		// Update admin page name to match original superuser
 		$stmt = $database->prepare("UPDATE pages SET name = :name WHERE id = :id");
 		$stmt->execute([':name' => $superuser['name'], ':id' => $id]);
 
-		// Update password (core install.sql created an empty entry)
+		// Insert password (table was just recreated, empty for user 41)
 		$stmt = $database->prepare(
-			"UPDATE field_pass SET data = :data, salt = :salt WHERE pages_id = :id"
+			"INSERT INTO field_pass (pages_id, data, salt) VALUES (:id, :data, :salt)"
 		);
 		$stmt->execute([
 			':id' => $id,
@@ -395,13 +436,11 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			':salt' => $superuser['pass_salt'],
 		]);
 
-		// Update email (core install.sql created an empty entry)
-		if (!empty($superuser['email'])) {
-			$stmt = $database->prepare(
-				"UPDATE field_email SET data = :data WHERE pages_id = :id"
-			);
-			$stmt->execute([':id' => $id, ':data' => $superuser['email']]);
-		}
+		// Insert email (table was just recreated)
+		$stmt = $database->prepare(
+			"INSERT INTO field_email (pages_id, data) VALUES (:id, :data)"
+		);
+		$stmt->execute([':id' => $id, ':data' => $superuser['email'] ?: '']);
 
 		// Roles and permissions are already set up by the core install.sql:
 		//   field_roles: user 41 gets guest + superuser roles
