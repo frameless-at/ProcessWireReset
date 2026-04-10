@@ -332,6 +332,12 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$keptModuleData = $this->backupModuleData($database, $data);
 		$profileTemplatesPath = $this->resolveProfileTemplatesPath($data);
 
+		// Compute the topologically sorted install order including ALL
+		// transitive dependencies (site + core modules). Used to explicitly
+		// install each module after the reset instead of relying on PW's
+		// nested auto-install from within install().
+		$installOrder = $this->resolveInstallOrder((array) $data['keepModules']);
+
 		// Back up custom tables (any table not defined in install.sql) —
 		// these typically belong to modules that create their own storage
 		// (e.g. login throttle, logs, custom module caches).
@@ -352,7 +358,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// so admin pages, custom fields, DB tables etc. are recreated.
 		$this->restoreSelfModule($database, $keptModuleData);
 		$this->restoreCustomTables($database, $customTables);
-		$this->writePendingInstalls($keptModuleData);
+		$this->writePendingInstalls($keptModuleData, $installOrder);
 
 		// ── Phase 3: Filesystem reset ────────────────────────────────────
 
@@ -772,16 +778,23 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 *
 	 * @param array $keptModuleData
 	 */
-	protected function writePendingInstalls(array $keptModuleData) {
+	protected function writePendingInstalls(array $keptModuleData, array $installOrder) {
 		$selfClass = $this->className();
 		$pending = [];
-		foreach ($keptModuleData as $className => $moduleData) {
+
+		foreach ($installOrder as $className) {
 			if ($className === $selfClass) continue;
-			$pending[] = [
-				'class' => $moduleData['class'],
-				'flags' => $moduleData['flags'],
-				'data' => $moduleData['data'],
-			];
+
+			$item = ['class' => $className];
+			// Include backed-up config for modules that were previously
+			// installed (user selection + their site-module transitive deps).
+			// Core modules added as dependencies have no backup data and
+			// will be installed with their default config.
+			if (isset($keptModuleData[$className])) {
+				$item['flags'] = (int) $keptModuleData[$className]['flags'];
+				$item['data'] = (string) $keptModuleData[$className]['data'];
+			}
+			$pending[] = $item;
 		}
 
 		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
@@ -900,6 +913,105 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		}
 
 		return array_keys($resolved);
+	}
+
+	/**
+	 * Resolve the full install order including core-module dependencies
+	 *
+	 * Walks the dependency graph starting from the user's selection,
+	 * collecting ALL transitive dependencies (both site and core modules).
+	 * Then performs a topological sort (Kahn's algorithm) so that
+	 * dependencies come before the modules that depend on them — ensuring
+	 * each module can be installed individually without relying on PW's
+	 * nested auto-install logic.
+	 *
+	 * Core modules that must be explicitly installed (e.g. InputfieldCKEditor,
+	 * FieldtypeMapMarker) are included in the list; already-installed core
+	 * modules will be skipped by the install loop via the DB-direct check.
+	 *
+	 * @param array $keepModules Expanded keep-modules list (site modules)
+	 * @return array Class names in topological order (deps first)
+	 */
+	protected function resolveInstallOrder(array $keepModules) {
+		$modules = $this->wire('modules');
+		$selfClass = $this->className();
+
+		// Step 1: BFS through dependency graph, collecting requires info
+		$requires = [];  // class => [dep1, dep2, ...]
+		$queue = array_values(array_unique($keepModules));
+
+		while (!empty($queue)) {
+			$className = array_shift($queue);
+			if (empty($className) || isset($requires[$className])) continue;
+			if ($className === $selfClass) continue;
+			if ($className === 'ProcessWire' || $className === 'PHP') continue;
+
+			// Only consider modules that actually exist as files
+			$path = $modules->getModuleFile($className);
+			if (!$path) continue;
+
+			$info = $modules->getModuleInfoVerbose($className);
+			$deps = [];
+			$moduleRequires = isset($info['requires']) ? (array) $info['requires'] : [];
+
+			foreach ($moduleRequires as $req) {
+				if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m)) {
+					$depClass = $m[1];
+					if ($depClass === 'ProcessWire' || $depClass === 'PHP') continue;
+					if ($depClass === $selfClass) continue;
+					$deps[] = $depClass;
+					if (!isset($requires[$depClass])) {
+						$queue[] = $depClass;
+					}
+				}
+			}
+			$requires[$className] = $deps;
+		}
+
+		// Step 2: Topological sort via Kahn's algorithm
+		// in-degree of X = number of X's dependencies that are also in our set
+		$inDegree = [];
+		foreach ($requires as $class => $deps) {
+			$inDegree[$class] = 0;
+		}
+		foreach ($requires as $class => $deps) {
+			foreach ($deps as $dep) {
+				if (isset($requires[$dep])) {
+					$inDegree[$class]++;
+				}
+			}
+		}
+
+		// Start with modules that have no unresolved dependencies
+		$ready = [];
+		foreach ($inDegree as $class => $degree) {
+			if ($degree === 0) $ready[] = $class;
+		}
+
+		$sorted = [];
+		while (!empty($ready)) {
+			$class = array_shift($ready);
+			$sorted[] = $class;
+			// Decrement in-degree of modules that depend on $class
+			foreach ($requires as $other => $otherDeps) {
+				if (!in_array($class, $otherDeps)) continue;
+				if (!isset($inDegree[$other]) || $inDegree[$other] <= 0) continue;
+				$inDegree[$other]--;
+				if ($inDegree[$other] === 0) {
+					$ready[] = $other;
+				}
+			}
+		}
+
+		// Append any modules with remaining dependencies (cycles or
+		// unresolved refs) at the end as a safety net
+		foreach ($requires as $class => $deps) {
+			if (!in_array($class, $sorted)) {
+				$sorted[] = $class;
+			}
+		}
+
+		return $sorted;
 	}
 
 	/**
