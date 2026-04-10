@@ -329,7 +329,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		}
 
 		$keepModuleDirs = $this->resolveKeepModuleDirs($data);
-		$keptModuleData = $this->backupModuleData($database, $data);
 		$profileTemplatesPath = $this->resolveProfileTemplatesPath($data);
 
 		// Compute the topologically sorted install order including ALL
@@ -337,6 +336,11 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// install each module after the reset instead of relying on PW's
 		// nested auto-install from within install().
 		$installOrder = $this->resolveInstallOrder((array) $data['keepModules']);
+
+		// Back up DB config/flags for every module in the install order
+		// (plus self). This captures user-set configuration for core-module
+		// dependencies too — e.g. CKEditor plugins, SessionHandlerDB settings.
+		$keptModuleData = $this->backupModuleData($database, $installOrder);
 
 		// Back up custom tables (any table not defined in install.sql) —
 		// these typically belong to modules that create their own storage
@@ -454,29 +458,32 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Backup module DB entries for modules we want to keep
+	 * Backup module DB entries (class, flags, data) for given module names
+	 *
+	 * Backs up the modules.data column for every module in the install list
+	 * (including self). Modules not currently in the modules table (e.g. core
+	 * modules that get installed as dependencies later) are skipped — they'll
+	 * be installed fresh with default config.
 	 *
 	 * @param WireDatabasePDO $database
-	 * @param array $data Module config data
-	 * @return array
+	 * @param array $moduleNames List of module class names to back up
+	 * @return array Map of className => ['class' => ..., 'flags' => ..., 'data' => ...]
 	 */
-	protected function backupModuleData($database, array $data) {
-		$moduleNames = array_merge([$this->className()], (array) $data['keepModules']);
+	protected function backupModuleData($database, array $moduleNames) {
+		$moduleNames = array_unique(array_merge([$this->className()], $moduleNames));
 		$result = [];
 
-		foreach (array_unique($moduleNames) as $className) {
+		foreach ($moduleNames as $className) {
 			try {
 				$stmt = $database->prepare("SELECT class, flags, data FROM modules WHERE class = :class");
 				$stmt->execute([':class' => $className]);
 				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
+				// Only back up modules that are actually installed. Unknown
+				// modules (e.g. core deps added by resolveInstallOrder but
+				// not yet installed) are skipped and will use defaults.
 				if ($row) $result[$className] = $row;
 			} catch (\Exception $e) {
-				// Module not in DB, will be inserted with defaults
-				$result[$className] = [
-					'class' => $className,
-					'flags' => 0,
-					'data' => '',
-				];
+				// Ignore errors — module not in DB means no config to back up
 			}
 		}
 
