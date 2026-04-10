@@ -12,6 +12,7 @@
 class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 	const CONFIRM_TEXT = 'RESET';
+	const PENDING_FILE = '.pending-installs.json';
 
 	public static function getModuleInfo() {
 		return [
@@ -21,7 +22,11 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			'author' => 'frameless',
 			'icon' => 'refresh',
 			'singular' => true,
-			'autoload' => false,
+			// Conditional autoload: only load automatically when there are
+			// pending module installs to process after a reset.
+			'autoload' => function() {
+				return file_exists(__DIR__ . '/.pending-installs.json');
+			},
 			'requires' => [
 				'ProcessWire>=3.0.0',
 			],
@@ -34,7 +39,80 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$this->set('keepModules', []);
 	}
 
-	public function init() {}
+	/**
+	 * Initialize — processes pending module installs if present
+	 *
+	 * When a reset has kept modules, their re-install is deferred to the
+	 * next request (when PW has a clean state). The pending file triggers
+	 * conditional autoload of this module, and init() runs the installs.
+	 */
+	public function init() {
+		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
+		if (!file_exists($pendingFile)) return;
+
+		// Process after PW is fully ready so installModule() has a clean API
+		$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
+	}
+
+	/**
+	 * Process deferred module installs from the pending file
+	 *
+	 * Runs each kept module's install() method (which creates admin pages,
+	 * DB tables, custom fields, etc.) and then restores the backed-up
+	 * config/flags to modules.data.
+	 */
+	public function processPendingInstalls() {
+		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
+		if (!file_exists($pendingFile)) return;
+
+		$pending = @json_decode(@file_get_contents($pendingFile), true);
+		// Delete file first to prevent infinite retries on error
+		@unlink($pendingFile);
+
+		if (!is_array($pending) || empty($pending)) return;
+
+		$modules = $this->wire('modules');
+		$database = $this->wire('database');
+		$config = $this->wire('config');
+		$log = $this->wire('log');
+
+		// Temporarily elevate to superuser for install operations
+		$savedUser = $this->wire('user');
+		$superuser = $this->wire('users')->get($config->superUserPageID);
+		if ($superuser && $superuser->id) {
+			$this->wire('user', $superuser);
+		}
+
+		// Refresh modules cache so PW rediscovers module files
+		$modules->refresh();
+
+		foreach ($pending as $item) {
+			$className = isset($item['class']) ? $item['class'] : '';
+			if (empty($className) || $className === $this->className()) continue;
+
+			try {
+				if (!$modules->isInstalled($className)) {
+					$modules->install($className);
+					$log->save('processwirereset', "Re-installed module: $className");
+				}
+
+				// Restore backed-up config/flags
+				$stmt = $database->prepare(
+					"UPDATE modules SET data = :data, flags = :flags WHERE class = :class"
+				);
+				$stmt->execute([
+					':data' => isset($item['data']) ? $item['data'] : '',
+					':flags' => isset($item['flags']) ? (int) $item['flags'] : 0,
+					':class' => $className,
+				]);
+			} catch (\Exception $e) {
+				$log->save('processwirereset', "Failed to install $className: " . $e->getMessage());
+			}
+		}
+
+		// Restore user context
+		$this->wire('user', $savedUser);
+	}
 
 	/**
 	 * Build the module config screen and handle reset action
@@ -205,8 +283,13 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$this->dropAllTables($database);
 		$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config);
 		$this->restoreSuperuser($database, $superuser, $config);
-		$this->restoreModules($database, $keptModuleData);
+		// Only re-register ProcessWireReset itself directly so PW can autoload
+		// it on the next request. Other kept modules are deferred — their
+		// install() is called in processPendingInstalls() on the next request,
+		// so admin pages, custom fields, DB tables etc. are recreated.
+		$this->restoreSelfModule($database, $keptModuleData);
 		$this->restoreCustomTables($database, $customTables);
+		$this->writePendingInstalls($keptModuleData);
 
 		// ── Phase 3: Filesystem reset ────────────────────────────────────
 
@@ -585,27 +668,65 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Re-register kept modules in the freshly imported modules table
+	 * Re-register ProcessWireReset itself in the fresh modules table
+	 *
+	 * Only self is restored immediately. Other kept modules are deferred
+	 * via writePendingInstalls() so their install() side effects (admin
+	 * pages, custom tables, fields) are recreated on the next request.
 	 *
 	 * @param WireDatabasePDO $database
 	 * @param array $keptModuleData
 	 */
-	protected function restoreModules($database, array $keptModuleData) {
-		foreach ($keptModuleData as $className => $moduleData) {
-			// Check if module already exists in the fresh DB (e.g. core module)
-			$stmt = $database->prepare("SELECT id FROM modules WHERE class = :class");
-			$stmt->execute([':class' => $moduleData['class']]);
-			if ($stmt->fetch()) continue;
+	protected function restoreSelfModule($database, array $keptModuleData) {
+		$selfClass = $this->className();
+		$selfData = isset($keptModuleData[$selfClass]) ? $keptModuleData[$selfClass] : [
+			'class' => $selfClass,
+			'flags' => 0,
+			'data' => '',
+		];
 
-			$stmt = $database->prepare(
-				"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
-			);
-			$stmt->execute([
-				':class' => $moduleData['class'],
-				':flags' => $moduleData['flags'],
-				':data' => $moduleData['data'],
-			]);
+		$stmt = $database->prepare("SELECT id FROM modules WHERE class = :class");
+		$stmt->execute([':class' => $selfClass]);
+		if ($stmt->fetch()) return;
+
+		$stmt = $database->prepare(
+			"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
+		);
+		$stmt->execute([
+			':class' => $selfClass,
+			':flags' => $selfData['flags'],
+			':data' => $selfData['data'],
+		]);
+	}
+
+	/**
+	 * Write kept modules (except self) to the pending-installs file
+	 *
+	 * The next request loads ProcessWireReset as autoload (triggered by the
+	 * presence of this file), and processPendingInstalls() calls each
+	 * module's install() to recreate admin pages, tables, and other side
+	 * effects, then restores the backed-up config.
+	 *
+	 * @param array $keptModuleData
+	 */
+	protected function writePendingInstalls(array $keptModuleData) {
+		$selfClass = $this->className();
+		$pending = [];
+		foreach ($keptModuleData as $className => $moduleData) {
+			if ($className === $selfClass) continue;
+			$pending[] = [
+				'class' => $moduleData['class'],
+				'flags' => $moduleData['flags'],
+				'data' => $moduleData['data'],
+			];
 		}
+
+		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
+		if (empty($pending)) {
+			@unlink($pendingFile);
+			return;
+		}
+		@file_put_contents($pendingFile, json_encode($pending, JSON_PRETTY_PRINT));
 	}
 
 	/**
