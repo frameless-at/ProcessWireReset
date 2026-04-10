@@ -228,6 +228,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$f->attr('name', 'keepModules');
 		$f->label = $this->_('Select modules to preserve during reset');
 		$f->description = $this->_('These site modules and their files will survive the reset. ProcessWireReset is always preserved automatically.');
+		$f->notes = $this->_('Transitive site-module dependencies are automatically included — selecting a module also preserves any modules it requires.');
 
 		$siteModulesPath = $this->wire('config')->paths->siteModules;
 		foreach ($modules as $module) {
@@ -302,6 +303,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				));
 			}
 		}
+
+		// Automatically include all transitive site-module dependencies so
+		// preserving Module A also preserves the modules it requires.
+		$data['keepModules'] = $this->expandKeepModules((array) $data['keepModules']);
 
 		// ── Phase 1: Gather data before destroying anything ──────────────
 
@@ -846,6 +851,55 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		}
 		$path = __DIR__ . '/install/site-templates/';
 		return is_dir($path) ? $path : null;
+	}
+
+	/**
+	 * Expand the user's keep-modules selection to include transitive deps
+	 *
+	 * Walks each selected module's 'requires' info and recursively includes
+	 * any site-module (not core) dependencies. This ensures that preserving
+	 * Module A also preserves the site modules it needs to function (B → C → ...).
+	 * Core modules are excluded because they always live in wire/modules/
+	 * and survive a reset untouched.
+	 *
+	 * @param array $keepModules User-selected module class names
+	 * @return array Expanded list including transitive site-module dependencies
+	 */
+	protected function expandKeepModules(array $keepModules) {
+		$modules = $this->wire('modules');
+		$siteModulesPath = $this->wire('config')->paths->siteModules;
+		$selfClass = $this->className();
+
+		$resolved = [];
+		$stack = array_values(array_unique($keepModules));
+
+		while (!empty($stack)) {
+			$className = array_shift($stack);
+			if (empty($className) || isset($resolved[$className])) continue;
+			if ($className === $selfClass) continue;
+
+			// Only include site modules — core modules always survive
+			$path = $modules->getModuleFile($className);
+			if (!$path || strpos($path, $siteModulesPath) !== 0) continue;
+
+			$resolved[$className] = true;
+
+			// Inspect dependencies via verbose info
+			$info = $modules->getModuleInfoVerbose($className);
+			$requires = isset($info['requires']) ? (array) $info['requires'] : [];
+
+			foreach ($requires as $req) {
+				// Strip optional version constraint: "ModuleName>=1.0.0" → "ModuleName"
+				if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m)) {
+					$depClass = $m[1];
+					if (!isset($resolved[$depClass])) {
+						$stack[] = $depClass;
+					}
+				}
+			}
+		}
+
+		return array_keys($resolved);
 	}
 
 	/**
