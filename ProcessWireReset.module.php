@@ -65,9 +65,15 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
 		if (!file_exists($pendingFile)) return;
 
-		$pending = @json_decode(@file_get_contents($pendingFile), true);
-		// Delete file first to prevent infinite retries on error
-		@unlink($pendingFile);
+		$contents = file_get_contents($pendingFile);
+		$pending = $contents !== false ? json_decode($contents, true) : null;
+
+		// Delete file first to prevent infinite retries on error.
+		// If deletion fails (rare), log but continue — the worst case is one
+		// extra attempt on the next request, not an infinite loop.
+		if (!unlink($pendingFile)) {
+			$this->wire('log')->error("ProcessWireReset: Could not remove pending file: $pendingFile");
+		}
 
 		if (!is_array($pending) || empty($pending)) return;
 
@@ -173,28 +179,57 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Build the module config screen and handle reset action
+	 * Module config screen entry point
+	 *
+	 * Delegates to two helpers: handleResetPostRequest() for POST handling
+	 * (executes the reset if the user confirmed) and buildConfigInputfields()
+	 * for the actual form construction.
 	 *
 	 * @param array $data Saved config data
 	 * @return InputfieldWrapper
 	 */
 	public function getModuleConfigInputfields(array $data) {
+		$this->handleResetPostRequest($data);
+		return $this->buildConfigInputfields($data);
+	}
+
+	/**
+	 * Detect and execute the reset action from POST data
+	 *
+	 * If the user clicked the "Reset Installation" button and supplied the
+	 * confirmation text, executeReset() is called. executeReset() ends the
+	 * request via exit(), so this method does not return on success.
+	 *
+	 * @param array $data Saved config data
+	 */
+	private function handleResetPostRequest(array $data) {
 		$input = $this->wire('input');
-		$modules = $this->wire('modules');
+		if (!$input->requestMethod('POST')) return;
+		if ($input->post('submit_reset') === null) return;
 
-		if (!isset($data['profilePath'])) $data['profilePath'] = '';
-		if (!isset($data['keepModules'])) $data['keepModules'] = [];
-
-		// Handle reset action on POST
-		if ($input->requestMethod('POST') && $input->post('submit_reset') !== null) {
-			$confirm = $input->post('confirmReset');
-			if ($confirm === self::CONFIRM_TEXT) {
-				$this->executeReset($data);
-				// executeReset exits; this line is never reached
-			}
-			$this->error($this->_('Confirmation text did not match. Reset was not executed.'));
+		if ($input->post('confirmReset') === self::CONFIRM_TEXT) {
+			$this->executeReset($data);
+			// executeReset() exits — control never reaches here on success
+			return;
 		}
 
+		$this->error($this->_('Confirmation text did not match. Reset was not executed.'));
+	}
+
+	/**
+	 * Build the InputfieldWrapper for the module config screen
+	 *
+	 * @param array $data Saved config data (may be missing keys for fresh installs)
+	 * @return InputfieldWrapper
+	 */
+	private function buildConfigInputfields(array $data) {
+		// Merge with defaults — modules.data can be empty on fresh install
+		$data = array_merge([
+			'profilePath' => '',
+			'keepModules' => [],
+		], $data);
+
+		$modules = $this->wire('modules');
 		$inputfields = $this->wire(new InputfieldWrapper());
 
 		// ── Profile Settings ─────────────────────────────────────────────
@@ -279,10 +314,21 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Execute the full installation reset
 	 *
+	 * Drops all tables, reimports from install.sql, restores the superuser,
+	 * cleans the filesystem, and writes the deferred-install pending file.
+	 * On success, sends a redirect header and exits the request.
+	 *
 	 * @param array $data Current module config data
+	 * @throws WireException If the SQL import or DB reset phase fails
 	 */
 	protected function executeReset(array $data) {
 		set_time_limit(300);
+
+		// Merge with defaults — saved config may be missing keys
+		$data = array_merge([
+			'profilePath' => '',
+			'keepModules' => [],
+		], $data);
 
 		$database = $this->wire('database');
 		$config = $this->wire('config');
@@ -352,17 +398,36 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		}
 
 		// ── Phase 2: Database reset ──────────────────────────────────────
+		//
+		// Note: MySQL/MariaDB DDL statements (DROP TABLE, CREATE TABLE) cause
+		// implicit commits and cannot be rolled back, so wrapping this phase
+		// in a transaction would be misleading. Instead, we use try/catch to
+		// surface errors clearly and clean up any partial state on failure.
+		try {
+			$this->dropAllTables($database);
+			$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config);
+			$this->restoreSuperuser($database, $superuser, $config);
+			// Only re-register ProcessWireReset itself directly so PW can autoload
+			// it on the next request. Other kept modules are deferred — their
+			// install() is called in processPendingInstalls() on the next request,
+			// so admin pages, custom fields, DB tables etc. are recreated.
+			$this->restoreSelfModule($database, $keptModuleData);
+			$this->restoreCustomTables($database, $customTables);
+			$this->writePendingInstalls($keptModuleData, $installOrder);
+		} catch (\Exception $e) {
+			// Remove any half-written pending file so the next request doesn't
+			// try to install modules into an inconsistent DB state.
+			$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
+			if (file_exists($pendingFile)) unlink($pendingFile);
 
-		$this->dropAllTables($database);
-		$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config);
-		$this->restoreSuperuser($database, $superuser, $config);
-		// Only re-register ProcessWireReset itself directly so PW can autoload
-		// it on the next request. Other kept modules are deferred — their
-		// install() is called in processPendingInstalls() on the next request,
-		// so admin pages, custom fields, DB tables etc. are recreated.
-		$this->restoreSelfModule($database, $keptModuleData);
-		$this->restoreCustomTables($database, $customTables);
-		$this->writePendingInstalls($keptModuleData, $installOrder);
+			$this->wire('log')->error('ProcessWireReset: DB reset phase failed: ' . $e->getMessage());
+			throw new WireException(
+				'Database reset failed: ' . $e->getMessage() .
+				' — installation may be in an inconsistent state. Use repair.php to recover.',
+				0,
+				$e
+			);
+		}
 
 		// ── Phase 3: Filesystem reset ────────────────────────────────────
 
@@ -394,7 +459,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		// ── Phase 4: Redirect to login ───────────────────────────────────
 
-		$adminUrl = $config->urls->admin;
+		$adminUrl = $this->safeRedirectUrl($config->urls->admin);
 
 		// Send redirect and close connection before shutdown handlers fire
 		header("Location: $adminUrl");
@@ -452,7 +517,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				'pass_schema' => $passSchema,
 				'email_schema' => $emailSchema,
 			];
-		} catch (\Exception $e) {
+		} catch (\PDOException $e) {
 			return null;
 		}
 	}
@@ -482,7 +547,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				// modules (e.g. core deps added by resolveInstallOrder but
 				// not yet installed) are skipped and will use defaults.
 				if ($row) $result[$className] = $row;
-			} catch (\Exception $e) {
+			} catch (\PDOException $e) {
 				// Ignore errors — module not in DB means no config to back up
 			}
 		}
@@ -502,7 +567,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		try {
 			$row = $database->query("SHOW CREATE TABLE `$table`")->fetch(\PDO::FETCH_NUM);
 			return $row ? $row[1] : '';
-		} catch (\Exception $e) {
+		} catch (\PDOException $e) {
 			return '';
 		}
 	}
@@ -520,7 +585,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	protected function getCanonicalTables(...$files) {
 		$tables = [];
 		foreach ($files as $file) {
-			$content = @file_get_contents($file);
+			if (!is_file($file) || !is_readable($file)) continue;
+			$content = file_get_contents($file);
 			if ($content === false) continue;
 			if (preg_match_all('/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i', $content, $matches)) {
 				foreach ($matches[1] as $tableName) {
@@ -556,7 +622,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			try {
 				$stmt = $database->query("SELECT * FROM `$safeTable`");
 				$rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
-			} catch (\Exception $e) {
+			} catch (\PDOException $e) {
 				// Skip tables we can't read
 				continue;
 			}
@@ -608,8 +674,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 						"INSERT INTO `$table` ($colsSql) VALUES ($phSql)"
 					);
 					$stmt->execute($bindParams);
-				} catch (\Exception $e) {
+				} catch (\PDOException $e) {
 					// Continue on row errors — don't fail the whole table
+					$this->wire('log')->error("ProcessWireReset: row insert failed for `$table`: " . $e->getMessage());
 				}
 			}
 		}
@@ -650,7 +717,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				if ($safe === '') continue;
 				try {
 					$database->exec("DROP TABLE IF EXISTS `$safe`");
-				} catch (\Exception $e) {
+				} catch (\PDOException $e) {
 					// Continue — retry in next pass
 				}
 			}
@@ -668,8 +735,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $view);
 				if ($safe !== '') $database->exec("DROP VIEW IF EXISTS `$safe`");
 			}
-		} catch (\Exception $e) {
-			// Ignore
+		} catch (\PDOException $e) {
+			// Ignore — views are optional cleanup
 		}
 
 		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
@@ -837,6 +904,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * effects, then restores the backed-up config.
 	 *
 	 * @param array $keptModuleData
+	 * @param array $installOrder
+	 * @throws WireException If the pending file cannot be written
 	 */
 	protected function writePendingInstalls(array $keptModuleData, array $installOrder) {
 		$selfClass = $this->className();
@@ -859,10 +928,18 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
 		if (empty($pending)) {
-			@unlink($pendingFile);
+			if (file_exists($pendingFile) && !unlink($pendingFile)) {
+				$this->wire('log')->error("ProcessWireReset: Could not remove pending file: $pendingFile");
+			}
 			return;
 		}
-		@file_put_contents($pendingFile, json_encode($pending, JSON_PRETTY_PRINT));
+		$json = json_encode($pending, JSON_PRETTY_PRINT);
+		if (file_put_contents($pendingFile, $json) === false) {
+			$this->wire('log')->error("ProcessWireReset: Could not write pending file: $pendingFile");
+			throw new WireException(
+				"Cannot write pending installs file at $pendingFile — kept modules will not be restored after reset."
+			);
+		}
 	}
 
 	/**
@@ -897,12 +974,19 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Resolve the path to the profile's install.sql
 	 *
+	 * For custom profile paths, the resolved absolute path is verified to
+	 * lie within the PW root directory to prevent directory traversal
+	 * (e.g. "../../../etc/passwd" would be rejected).
+	 *
 	 * @param array $data Module config data
-	 * @return string|null
+	 * @return string|null Absolute path to install.sql or null if invalid
 	 */
 	protected function resolveProfileInstallSql(array $data) {
 		if (!empty($data['profilePath'])) {
-			$path = rtrim($data['profilePath'], '/') . '/install.sql';
+			$candidate = rtrim($data['profilePath'], '/') . '/install.sql';
+			$path = realpath($candidate);
+			if ($path === false) return null;
+			if (!$this->isPathAllowed($path)) return null;
 			return is_file($path) ? $path : null;
 		}
 		return __DIR__ . '/install/install.sql';
@@ -912,18 +996,65 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * Resolve the path to the profile's template files
 	 *
 	 * For the bundled default, templates live in install/site-templates/.
-	 * For custom profiles, templates are expected at ../templates/ relative to the install dir.
+	 * For custom profiles, templates are expected at ../templates/ relative
+	 * to the install dir. Custom paths are validated against the PW root
+	 * to prevent directory traversal.
 	 *
 	 * @param array $data Module config data
-	 * @return string|null
+	 * @return string|null Absolute path to templates dir or null if invalid
 	 */
 	protected function resolveProfileTemplatesPath(array $data) {
 		if (!empty($data['profilePath'])) {
-			$path = dirname(rtrim($data['profilePath'], '/')) . '/templates/';
+			$candidate = dirname(rtrim($data['profilePath'], '/')) . '/templates/';
+			$path = realpath($candidate);
+			if ($path === false) return null;
+			if (!$this->isPathAllowed($path)) return null;
 			return is_dir($path) ? $path : null;
 		}
 		$path = __DIR__ . '/install/site-templates/';
 		return is_dir($path) ? $path : null;
+	}
+
+	/**
+	 * Verify that an absolute path is within the PW root directory
+	 *
+	 * Prevents directory traversal attacks via user-supplied profile paths.
+	 *
+	 * @param string $absolutePath A real (canonicalized) absolute path
+	 * @return bool True if the path is inside the PW root
+	 */
+	protected function isPathAllowed($absolutePath) {
+		$root = realpath($this->wire('config')->paths->root);
+		if ($root === false) return false;
+		return strpos($absolutePath, rtrim($root, '/') . '/') === 0
+			|| $absolutePath === $root;
+	}
+
+	/**
+	 * Sanitize a URL for use in a Location header
+	 *
+	 * Allows only same-host or relative URLs to prevent open-redirect /
+	 * header-injection attacks. Falls back to "./" if the URL points to
+	 * a different host or contains CR/LF.
+	 *
+	 * @param string $url
+	 * @return string Safe URL for Location header
+	 */
+	protected function safeRedirectUrl($url) {
+		// Strip any CR/LF (header injection guard)
+		$url = str_replace(["\r", "\n"], '', (string) $url);
+		if ($url === '') return './';
+
+		$parsed = parse_url($url);
+		if ($parsed === false) return './';
+
+		// If a host is specified, it must match the current request host
+		if (!empty($parsed['host'])) {
+			$currentHost = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
+			if ($parsed['host'] !== $currentHost) return './';
+		}
+
+		return $url;
 	}
 
 	/**
@@ -1104,11 +1235,15 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Empty a directory (remove all contents but keep the directory itself)
 	 *
+	 * Failures are logged via PW's log system instead of being suppressed.
+	 *
 	 * @param string $dir
 	 */
 	protected function emptyDirectory($dir) {
 		if (!is_dir($dir)) {
-			@mkdir($dir, 0755, true);
+			if (!mkdir($dir, 0755, true) && !is_dir($dir)) {
+				$this->wire('log')->error("ProcessWireReset: Could not create directory: $dir");
+			}
 			return;
 		}
 
@@ -1119,13 +1254,17 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			if ($item->isDir()) {
 				$this->removeDirectoryRecursive($path);
 			} else {
-				@unlink($path);
+				if (!unlink($path)) {
+					$this->wire('log')->error("ProcessWireReset: Could not delete file: $path");
+				}
 			}
 		}
 	}
 
 	/**
 	 * Recursively remove a directory and all its contents
+	 *
+	 * Failures are logged instead of suppressed.
 	 *
 	 * @param string $dir
 	 */
@@ -1138,14 +1277,16 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		);
 
 		foreach ($items as $item) {
-			if ($item->isDir()) {
-				@rmdir($item->getPathname());
-			} else {
-				@unlink($item->getPathname());
+			$path = $item->getPathname();
+			$ok = $item->isDir() ? rmdir($path) : unlink($path);
+			if (!$ok) {
+				$this->wire('log')->error("ProcessWireReset: Could not remove: $path");
 			}
 		}
 
-		@rmdir($dir);
+		if (!rmdir($dir)) {
+			$this->wire('log')->error("ProcessWireReset: Could not remove directory: $dir");
+		}
 	}
 
 	/**
@@ -1155,7 +1296,12 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * @param string $dst Destination directory
 	 */
 	protected function copyDirectoryRecursive($src, $dst) {
-		if (!is_dir($dst)) mkdir($dst, 0755, true);
+		if (!is_dir($dst)) {
+			if (!mkdir($dst, 0755, true) && !is_dir($dst)) {
+				$this->wire('log')->error("ProcessWireReset: Could not create directory: $dst");
+				return;
+			}
+		}
 
 		$iterator = new \DirectoryIterator($src);
 		foreach ($iterator as $item) {
@@ -1167,7 +1313,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			if ($item->isDir()) {
 				$this->copyDirectoryRecursive($srcPath, $dstPath);
 			} else {
-				copy($srcPath, $dstPath);
+				if (!copy($srcPath, $dstPath)) {
+					$this->wire('log')->error("ProcessWireReset: Could not copy $srcPath to $dstPath");
+				}
 			}
 		}
 	}
@@ -1188,7 +1336,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$name = $item->getFilename();
 
 			// Always keep README files
-			if (strtolower($name) === 'readme.txt' || strtolower($name) === 'readme.md') continue;
+			$nameLower = strtolower($name);
+			if ($nameLower === 'readme.txt' || $nameLower === 'readme.md') continue;
 
 			// Keep if in the preserve list
 			$baseName = pathinfo($name, PATHINFO_FILENAME);
@@ -1198,7 +1347,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			if ($item->isDir()) {
 				$this->removeDirectoryRecursive($path);
 			} else {
-				@unlink($path);
+				if (!unlink($path)) {
+					$this->wire('log')->error("ProcessWireReset: Could not delete file: $path");
+				}
 			}
 		}
 	}
