@@ -334,20 +334,27 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$config = $this->wire('config');
 		$input = $this->wire('input');
 
-		// Read current form selection from POST (not yet saved to $data)
-		$postProfilePath = $input->post('profilePath');
-		if ($postProfilePath !== null) {
-			$data['profilePath'] = (string) $postProfilePath;
-		}
-		$postKeepModules = $input->post('keepModules');
-		if ($postKeepModules !== null) {
-			if (is_array($postKeepModules)) {
-				$data['keepModules'] = $postKeepModules;
-			} else {
-				$data['keepModules'] = array_values(array_filter(
-					array_map('trim', explode(',', (string) $postKeepModules))
-				));
-			}
+		// executeReset() only runs from a POST submission of our reset form,
+		// so POST values are authoritative — NOT the saved config. Using the
+		// saved config as fallback is wrong: the user may have just deselected
+		// modules in the AsmSelect without clicking the main Submit to persist,
+		// and the form could still legitimately mean "clean reset, keep nothing".
+		$data['profilePath'] = (string) ($input->post('profilePath') ?? '');
+
+		$rawKeepModules = $input->post('keepModules');
+		if (is_array($rawKeepModules)) {
+			// AsmSelect posts as an array — filter out empty entries
+			$data['keepModules'] = array_values(array_filter(
+				array_map('strval', $rawKeepModules),
+				function($v) { return $v !== ''; }
+			));
+		} elseif (is_string($rawKeepModules) && $rawKeepModules !== '') {
+			$data['keepModules'] = array_values(array_filter(
+				array_map('trim', explode(',', $rawKeepModules))
+			));
+		} else {
+			// null, empty string, or unexpected type → nothing selected
+			$data['keepModules'] = [];
 		}
 
 		// Automatically include all transitive site-module dependencies so
