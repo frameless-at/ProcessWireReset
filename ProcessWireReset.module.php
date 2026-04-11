@@ -15,6 +15,16 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	const PENDING_FILE = '.pending-installs.json';
 	const PENDING_TABLES_FILE = '.pending-custom-tables.bin';
 
+	/**
+	 * Tracks filesystem operation failures during the reset phase.
+	 * Populated by emptyDirectory(), removeDirectoryRecursive(),
+	 * cleanModulesDirectory(), copyDirectoryRecursive(). Inspected at the
+	 * end of Phase 3 to decide whether to throw a WireException.
+	 *
+	 * @var string[]
+	 */
+	protected $fsFailures = [];
+
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProcessWire Reset',
@@ -411,6 +421,22 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// preserving Module A also preserves the modules it requires.
 		$data['keepModules'] = $this->expandKeepModules((array) $data['keepModules']);
 
+		// ── Phase 0: Pre-flight checks ───────────────────────────────────
+		//
+		// Verify we can actually write to and delete from every critical
+		// directory BEFORE touching the database. If any check fails, abort
+		// cleanly — nothing has been modified yet.
+		$preflightErrors = $this->preflightCheck();
+		if (!empty($preflightErrors)) {
+			foreach ($preflightErrors as $err) {
+				$this->error("Pre-flight check failed: $err");
+			}
+			throw new WireException(
+				'Reset aborted: filesystem permission check failed. Cannot proceed. Issues: '
+				. implode('; ', $preflightErrors)
+			);
+		}
+
 		// ── Phase 1: Gather data before destroying anything ──────────────
 
 		$superuser = $this->backupSuperuser($database, $config);
@@ -504,6 +530,11 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		$sitePath = $config->paths->site;
 
+		// Reset failure counter — tracks files/dirs that could not be deleted.
+		// Any non-zero count after the phase triggers an exception in the
+		// redirect step so the user sees a clear failure message.
+		$this->fsFailures = [];
+
 		$this->emptyDirectory($sitePath . 'assets/files/');
 		$this->emptyDirectory($sitePath . 'assets/cache/');
 		$this->emptyDirectory($sitePath . 'assets/logs/');
@@ -519,10 +550,29 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$this->cleanModulesDirectory($sitePath . 'modules/', $keepModuleDirs);
 
 		// Ensure installed.php exists (prevents PW installer from running)
-		file_put_contents(
+		if (file_put_contents(
 			$sitePath . 'assets/installed.php',
 			"<?php // The existence of this file prevents the installer from running."
-		);
+		) === false) {
+			$this->fsFailures[] = $sitePath . 'assets/installed.php (could not write)';
+		}
+
+		// If any filesystem operation failed, refuse to silently declare
+		// success. The DB reset has already happened so we cannot roll back,
+		// but we CAN tell the user so they don't ship a half-cleaned install.
+		if (!empty($this->fsFailures)) {
+			$summary = count($this->fsFailures) . ' filesystem operation(s) failed';
+			$this->wire('log')->error(
+				"ProcessWireReset: $summary:\n- " . implode("\n- ", $this->fsFailures)
+			);
+			throw new WireException(
+				"Reset finished DB phase but $summary. "
+				. "The database is clean but some files/directories could not be removed. "
+				. "Check write permissions on site/modules/, site/templates/, and site/assets/. "
+				. "Failed paths (first 10):\n- "
+				. implode("\n- ", array_slice($this->fsFailures, 0, 10))
+			);
+		}
 
 		// ── Phase 4: Redirect to login ───────────────────────────────────
 
@@ -1334,16 +1384,111 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	// =====================================================================
 
 	/**
+	 * Record a filesystem operation failure
+	 *
+	 * Adds the failure to $this->fsFailures so Phase 3 can detect it at
+	 * the end and raise a WireException. Also logs to PW's log system.
+	 *
+	 * @param string $message
+	 */
+	protected function fsFailure($message) {
+		$this->fsFailures[] = $message;
+		$this->wire('log')->error("ProcessWireReset: $message");
+	}
+
+	/**
+	 * Pre-flight filesystem permission check
+	 *
+	 * Before the destructive phase starts, verify we can actually create
+	 * AND delete files in every directory the reset will touch. is_writable()
+	 * alone is not enough — on some setups files created by another user
+	 * cannot be deleted even if the parent directory is nominally writable.
+	 *
+	 * The check creates a unique temporary file in each directory, then
+	 * immediately deletes it. If either step fails, the path is recorded as
+	 * unusable.
+	 *
+	 * @return string[] Array of human-readable error messages (empty = all OK)
+	 */
+	protected function preflightCheck() {
+		$config = $this->wire('config');
+		$sitePath = $config->paths->site;
+
+		// Paths the reset needs to write to / delete from
+		$paths = [
+			$sitePath . 'assets/files/',
+			$sitePath . 'assets/cache/',
+			$sitePath . 'assets/logs/',
+			$sitePath . 'assets/sessions/',
+			$sitePath . 'assets/',        // for installed.php write
+			$sitePath . 'templates/',
+			$sitePath . 'modules/',
+			__DIR__ . '/',                // for pending files
+		];
+
+		$errors = [];
+		foreach ($paths as $path) {
+			if (!is_dir($path)) {
+				// Missing dirs for assets are fine — emptyDirectory() will mkdir
+				// them. But we still need write access on the parent.
+				$parent = dirname(rtrim($path, '/'));
+				if (!is_dir($parent) || !is_writable($parent)) {
+					$errors[] = "$path does not exist and its parent is not writable";
+				}
+				continue;
+			}
+
+			if (!is_writable($path)) {
+				$errors[] = "$path is not writable";
+				continue;
+			}
+
+			// Try the actual create + delete dance
+			$testFile = rtrim($path, '/') . '/.pwreset-preflight-' . uniqid('', true);
+			$written = @file_put_contents($testFile, 'ok');
+			if ($written === false) {
+				$errors[] = "$path: cannot create files (write failed)";
+				continue;
+			}
+			if (!@unlink($testFile)) {
+				$errors[] = "$path: cannot delete files (created a test file but could not remove it — $testFile)";
+				// Best effort: don't leave the test file behind
+				continue;
+			}
+		}
+
+		// Also verify that the kept-module directories can be traversed
+		// (we recursively walk into them during cleanModulesDirectory and need
+		// to read file metadata there).
+		$modulesDir = $sitePath . 'modules/';
+		if (is_dir($modulesDir)) {
+			try {
+				$iter = new \DirectoryIterator($modulesDir);
+				foreach ($iter as $item) {
+					if ($item->isDot()) continue;
+					if (!$item->isReadable()) {
+						$errors[] = "$modulesDir{$item->getFilename()}: not readable";
+					}
+				}
+			} catch (\Exception $e) {
+				$errors[] = "$modulesDir: cannot iterate (" . $e->getMessage() . ")";
+			}
+		}
+
+		return $errors;
+	}
+
+	/**
 	 * Empty a directory (remove all contents but keep the directory itself)
 	 *
-	 * Failures are logged via PW's log system instead of being suppressed.
+	 * Failures are tracked in $this->fsFailures and raised by Phase 3.
 	 *
 	 * @param string $dir
 	 */
 	protected function emptyDirectory($dir) {
 		if (!is_dir($dir)) {
 			if (!mkdir($dir, 0755, true) && !is_dir($dir)) {
-				$this->wire('log')->error("ProcessWireReset: Could not create directory: $dir");
+				$this->fsFailure("Could not create directory: $dir");
 			}
 			return;
 		}
@@ -1356,7 +1501,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				$this->removeDirectoryRecursive($path);
 			} else {
 				if (!unlink($path)) {
-					$this->wire('log')->error("ProcessWireReset: Could not delete file: $path");
+					$this->fsFailure("Could not delete file: $path");
 				}
 			}
 		}
@@ -1365,7 +1510,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Recursively remove a directory and all its contents
 	 *
-	 * Failures are logged instead of suppressed.
+	 * Failures are tracked in $this->fsFailures and raised by Phase 3.
 	 *
 	 * @param string $dir
 	 */
@@ -1381,12 +1526,12 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$path = $item->getPathname();
 			$ok = $item->isDir() ? rmdir($path) : unlink($path);
 			if (!$ok) {
-				$this->wire('log')->error("ProcessWireReset: Could not remove: $path");
+				$this->fsFailure("Could not remove: $path");
 			}
 		}
 
 		if (!rmdir($dir)) {
-			$this->wire('log')->error("ProcessWireReset: Could not remove directory: $dir");
+			$this->fsFailure("Could not remove directory: $dir");
 		}
 	}
 
@@ -1399,7 +1544,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	protected function copyDirectoryRecursive($src, $dst) {
 		if (!is_dir($dst)) {
 			if (!mkdir($dst, 0755, true) && !is_dir($dst)) {
-				$this->wire('log')->error("ProcessWireReset: Could not create directory: $dst");
+				$this->fsFailure("Could not create directory: $dst");
 				return;
 			}
 		}
@@ -1415,7 +1560,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				$this->copyDirectoryRecursive($srcPath, $dstPath);
 			} else {
 				if (!copy($srcPath, $dstPath)) {
-					$this->wire('log')->error("ProcessWireReset: Could not copy $srcPath to $dstPath");
+					$this->fsFailure("Could not copy $srcPath to $dstPath");
 				}
 			}
 		}
@@ -1449,7 +1594,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				$this->removeDirectoryRecursive($path);
 			} else {
 				if (!unlink($path)) {
-					$this->wire('log')->error("ProcessWireReset: Could not delete file: $path");
+					$this->fsFailure("Could not delete file: $path");
 				}
 			}
 		}
