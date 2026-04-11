@@ -535,10 +535,11 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// redirect step so the user sees a clear failure message.
 		$this->fsFailures = [];
 
-		$this->emptyDirectory($sitePath . 'assets/files/');
-		$this->emptyDirectory($sitePath . 'assets/cache/');
-		$this->emptyDirectory($sitePath . 'assets/logs/');
-		$this->emptyDirectory($sitePath . 'assets/sessions/');
+		// Clean site/assets/ — empties the four standard dirs (files, cache,
+		// logs, sessions) and removes any other entries that modules may
+		// have created (e.g. assets/TracyDebugger/, assets/backups/,
+		// assets/FormBuilder/). Keeps installed.php and index.php.
+		$this->cleanAssetsDirectory($sitePath . 'assets/');
 
 		// Reset templates to profile state
 		$this->emptyDirectory($sitePath . 'templates/');
@@ -1561,6 +1562,52 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			} else {
 				if (!copy($srcPath, $dstPath)) {
 					$this->fsFailure("Could not copy $srcPath to $dstPath");
+				}
+			}
+		}
+	}
+
+	/**
+	 * Clean site/assets/ — empty the standard dirs, wipe everything else
+	 *
+	 * The four standard PW dirs (files, cache, logs, sessions) have their
+	 * contents emptied but the directories themselves are preserved. Any
+	 * other entry in site/assets/ (files or directories created by modules,
+	 * e.g. TracyDebugger/, backups/, FormBuilder/, SearchEngine/) is
+	 * removed entirely.
+	 *
+	 * Preserved as-is (not touched):
+	 *   - installed.php (we rewrite it afterwards anyway)
+	 *   - index.php (access guard file sometimes placed here)
+	 *   - .htaccess (apache config)
+	 *
+	 * @param string $assetsDir Path to site/assets/
+	 */
+	protected function cleanAssetsDirectory($assetsDir) {
+		if (!is_dir($assetsDir)) return;
+
+		$standardDirs = ['files', 'cache', 'logs', 'sessions'];
+		$preserveFiles = ['installed.php', 'index.php', '.htaccess'];
+
+		$iterator = new \DirectoryIterator($assetsDir);
+		foreach ($iterator as $item) {
+			if ($item->isDot()) continue;
+
+			$name = $item->getFilename();
+			$path = $item->getPathname();
+
+			if ($item->isDir()) {
+				if (in_array($name, $standardDirs, true)) {
+					// Empty the standard dir but keep the directory itself
+					$this->emptyDirectory($path);
+				} else {
+					// Unknown dir (module-created) — remove entirely
+					$this->removeDirectoryRecursive($path);
+				}
+			} else {
+				if (in_array($name, $preserveFiles, true)) continue;
+				if (!unlink($path)) {
+					$this->fsFailure("Could not delete file: $path");
 				}
 			}
 		}
