@@ -18,7 +18,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProcessWire Reset',
-			'version' => '0.0.1',
+			'version' => '0.1.0',
 			'summary' => 'Resets a ProcessWire installation to a clean profile state while preserving the current superuser and selected modules.',
 			'author' => 'frameless',
 			'icon' => 'refresh',
