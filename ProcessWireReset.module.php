@@ -620,18 +620,71 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Drop ALL tables in the current database
 	 *
+	 * Uses INFORMATION_SCHEMA scoped to the current DB (more reliable than
+	 * SHOW TABLES which can return stale results in some MySQL setups) and
+	 * a multi-pass approach to handle any tables that resist a single-pass
+	 * drop (e.g. due to FK constraints, table cache issues, or concurrent
+	 * connections). After dropping, throws if any tables remain.
+	 *
 	 * @param WireDatabasePDO $database
+	 * @throws WireException If tables remain after all drop passes
 	 */
 	protected function dropAllTables($database) {
+		$dbName = $this->wire('config')->dbName;
+
 		$database->exec("SET FOREIGN_KEY_CHECKS = 0");
 
-		$tables = $database->query("SHOW TABLES")->fetchAll(\PDO::FETCH_COLUMN);
-		foreach ($tables as $table) {
-			$table = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
-			$database->exec("DROP TABLE IF EXISTS `$table`");
+		$maxPasses = 5;
+		for ($pass = 0; $pass < $maxPasses; $pass++) {
+			$stmt = $database->prepare(
+				"SELECT TABLE_NAME FROM information_schema.TABLES " .
+				"WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE'"
+			);
+			$stmt->execute([':db' => $dbName]);
+			$tables = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+
+			if (empty($tables)) break;
+
+			foreach ($tables as $table) {
+				$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
+				if ($safe === '') continue;
+				try {
+					$database->exec("DROP TABLE IF EXISTS `$safe`");
+				} catch (\Exception $e) {
+					// Continue — retry in next pass
+				}
+			}
+		}
+
+		// Also drop any views that may exist
+		try {
+			$stmt = $database->prepare(
+				"SELECT TABLE_NAME FROM information_schema.TABLES " .
+				"WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'VIEW'"
+			);
+			$stmt->execute([':db' => $dbName]);
+			$views = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+			foreach ($views as $view) {
+				$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $view);
+				if ($safe !== '') $database->exec("DROP VIEW IF EXISTS `$safe`");
+			}
+		} catch (\Exception $e) {
+			// Ignore
 		}
 
 		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
+
+		// Verify clean state
+		$stmt = $database->prepare(
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = :db"
+		);
+		$stmt->execute([':db' => $dbName]);
+		$remaining = (int) $stmt->fetchColumn();
+		if ($remaining > 0) {
+			throw new WireException(
+				"dropAllTables: $remaining table(s) could not be dropped from database '$dbName'"
+			);
+		}
 	}
 
 	/**
