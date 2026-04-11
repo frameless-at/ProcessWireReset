@@ -13,6 +13,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 	const CONFIRM_TEXT = 'RESET';
 	const PENDING_FILE = '.pending-installs.json';
+	const PENDING_TABLES_FILE = '.pending-custom-tables.bin';
 
 	public static function getModuleInfo() {
 		return [
@@ -23,9 +24,11 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			'icon' => 'refresh',
 			'singular' => true,
 			// Conditional autoload: only load automatically when there are
-			// pending module installs to process after a reset.
+			// pending tasks (module installs or custom-table restore) to
+			// process after a reset.
 			'autoload' => function() {
-				return file_exists(__DIR__ . '/.pending-installs.json');
+				return file_exists(__DIR__ . '/.pending-installs.json')
+					|| file_exists(__DIR__ . '/.pending-custom-tables.bin');
 			},
 			'requires' => [
 				'ProcessWire>=3.0.0',
@@ -40,15 +43,17 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Initialize — processes pending module installs if present
+	 * Initialize — processes pending tasks from a previous reset if present
 	 *
-	 * When a reset has kept modules, their re-install is deferred to the
-	 * next request (when PW has a clean state). The pending file triggers
-	 * conditional autoload of this module, and init() runs the installs.
+	 * When a reset has kept modules, their re-install and custom-table
+	 * restore is deferred to the next request (when PW has a clean state).
+	 * The pending files trigger conditional autoload, and init() schedules
+	 * the processing hook.
 	 */
 	public function init() {
-		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
-		if (!file_exists($pendingFile)) return;
+		$pendingInstalls = file_exists(__DIR__ . '/' . self::PENDING_FILE);
+		$pendingTables = file_exists(__DIR__ . '/' . self::PENDING_TABLES_FILE);
+		if (!$pendingInstalls && !$pendingTables) return;
 
 		// Process after PW is fully ready so installModule() has a clean API
 		$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
@@ -174,8 +179,53 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$log->save('processwirereset', "Failed to install kept module $className: $reason");
 		}
 
+		// Restore custom tables AFTER all module installs completed. Each
+		// install() may have created empty versions of the tables we backed
+		// up — restoreCustomTables() drops the fresh versions and recreates
+		// them from the backup, preserving user data (matrix types, login
+		// throttle counters, log rows, etc.).
+		$this->processPendingCustomTables($database);
+
 		// Restore user context
 		$this->wire('user', $savedUser);
+	}
+
+	/**
+	 * Read the pending custom tables file and restore its contents
+	 *
+	 * Deletes the file after processing to prevent retries on the next
+	 * request.
+	 *
+	 * @param WireDatabasePDO $database
+	 */
+	protected function processPendingCustomTables($database) {
+		$pendingTablesFile = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+		if (!file_exists($pendingTablesFile)) return;
+
+		$raw = file_get_contents($pendingTablesFile);
+
+		// Delete file first to prevent retries on error
+		if (!unlink($pendingTablesFile)) {
+			$this->wire('log')->error("ProcessWireReset: Could not remove pending tables file: $pendingTablesFile");
+		}
+
+		if ($raw === false || $raw === '') return;
+
+		// Serialized PHP — any non-object classes; allowed_classes = false
+		$customTables = @unserialize($raw, ['allowed_classes' => false]);
+		if (!is_array($customTables) || empty($customTables)) return;
+
+		try {
+			$this->restoreCustomTables($database, $customTables);
+			$this->wire('log')->save(
+				'processwirereset',
+				'Restored custom tables: ' . implode(', ', array_keys($customTables))
+			);
+		} catch (\Exception $e) {
+			$this->wire('log')->error(
+				'ProcessWireReset: Custom table restore failed: ' . $e->getMessage()
+			);
+		}
 	}
 
 	/**
@@ -419,13 +469,23 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			// install() is called in processPendingInstalls() on the next request,
 			// so admin pages, custom fields, DB tables etc. are recreated.
 			$this->restoreSelfModule($database, $keptModuleData);
-			$this->restoreCustomTables($database, $customTables);
+			// Custom tables are NOT restored here. If we recreated them now,
+			// the next request's processPendingInstalls() would call each
+			// module's install() which in turn tries to CREATE TABLE for its
+			// own custom tables — and those CREATEs would fail because the
+			// tables already exist. Instead we defer the restore: serialize
+			// the backup to a pending file, and restoreCustomTables() runs
+			// in processPendingInstalls() AFTER all module installs have
+			// created their (empty) fresh tables.
+			$this->writePendingCustomTables($customTables);
 			$this->writePendingInstalls($keptModuleData, $installOrder);
 		} catch (\Exception $e) {
-			// Remove any half-written pending file so the next request doesn't
+			// Remove any half-written pending files so the next request doesn't
 			// try to install modules into an inconsistent DB state.
 			$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
 			if (file_exists($pendingFile)) unlink($pendingFile);
+			$pendingTablesFile = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+			if (file_exists($pendingTablesFile)) unlink($pendingTablesFile);
 
 			$this->wire('log')->error('ProcessWireReset: DB reset phase failed: ' . $e->getMessage());
 			throw new WireException(
@@ -945,6 +1005,40 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$this->wire('log')->error("ProcessWireReset: Could not write pending file: $pendingFile");
 			throw new WireException(
 				"Cannot write pending installs file at $pendingFile — kept modules will not be restored after reset."
+			);
+		}
+	}
+
+	/**
+	 * Write backed-up custom tables to a pending file for deferred restore
+	 *
+	 * Custom tables cannot be restored immediately after the DB reset: doing
+	 * so would conflict with the kept modules' install() methods on the next
+	 * request (which try to CREATE TABLE for their own storage). Instead we
+	 * serialize the backup to a pending file and restore it in
+	 * processPendingCustomTables() — after all install() calls have finished.
+	 *
+	 * Uses PHP serialize() rather than JSON because table rows may contain
+	 * binary data, non-UTF8 strings, or other non-JSON-safe values.
+	 *
+	 * @param array $customTables Output of backupCustomTables()
+	 * @throws WireException If the pending file cannot be written
+	 */
+	protected function writePendingCustomTables(array $customTables) {
+		$pendingFile = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+
+		if (empty($customTables)) {
+			if (file_exists($pendingFile) && !unlink($pendingFile)) {
+				$this->wire('log')->error("ProcessWireReset: Could not remove pending tables file: $pendingFile");
+			}
+			return;
+		}
+
+		$serialized = serialize($customTables);
+		if (file_put_contents($pendingFile, $serialized) === false) {
+			$this->wire('log')->error("ProcessWireReset: Could not write pending tables file: $pendingFile");
+			throw new WireException(
+				"Cannot write pending custom tables file at $pendingFile — module table data will not be restored."
 			);
 		}
 	}
