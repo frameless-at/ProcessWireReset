@@ -51,6 +51,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$this->set('profilePath', '');
 		$this->set('keepModules', []);
 		$this->set('keepDirectories', '');
+		$this->set('chmodDir', '');
+		$this->set('chmodFile', '');
 	}
 
 	/**
@@ -291,6 +293,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			'profilePath' => '',
 			'keepModules' => [],
 			'keepDirectories' => '',
+		'chmodDir' => '',
+		'chmodFile' => '',
 		], $data);
 
 		$modules = $this->wire('modules');
@@ -363,6 +367,40 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$f->collapsed = Inputfield::collapsedBlank;
 		$fs->add($f);
 
+		// ── File Permissions ─────────────────────────────────────────────
+
+		/** @var InputfieldFieldset $fs */
+		$fs = $modules->get('InputfieldFieldset');
+		$fs->label = $this->_('File Permissions');
+		$fs->icon = 'lock';
+		$fs->collapsed = Inputfield::collapsedYes;
+		$inputfields->add($fs);
+
+		$pwChmodDir = $this->wire('config')->chmodDir;
+		$pwChmodFile = $this->wire('config')->chmodFile;
+
+		/** @var InputfieldText $f */
+		$f = $modules->get('InputfieldText');
+		$f->attr('name', 'chmodDir');
+		$f->attr('value', $data['chmodDir']);
+		$f->label = $this->_('Directory permissions');
+		$f->description = $this->_('Octal permission for created directories.');
+		$f->notes = sprintf($this->_('Leave empty to use PW config value: %s'), $pwChmodDir ?: '0755');
+		$f->attr('placeholder', $pwChmodDir ?: '0755');
+		$f->columnWidth = 50;
+		$fs->add($f);
+
+		/** @var InputfieldText $f */
+		$f = $modules->get('InputfieldText');
+		$f->attr('name', 'chmodFile');
+		$f->attr('value', $data['chmodFile']);
+		$f->label = $this->_('File permissions');
+		$f->description = $this->_('Octal permission for created/copied files.');
+		$f->notes = sprintf($this->_('Leave empty to use PW config value: %s'), $pwChmodFile ?: '0644');
+		$f->attr('placeholder', $pwChmodFile ?: '0644');
+		$f->columnWidth = 50;
+		$fs->add($f);
+
 		// ── Execute Reset ────────────────────────────────────────────────
 
 		/** @var InputfieldFieldset $fs */
@@ -412,6 +450,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			'profilePath' => '',
 			'keepModules' => [],
 			'keepDirectories' => '',
+			'chmodDir' => '',
+			'chmodFile' => '',
 		], $data);
 
 		$database = $this->wire('database');
@@ -1583,7 +1623,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	protected function emptyDirectory($dir, array $keepDirPaths = []) {
 		if (!is_dir($dir)) {
-			if (!mkdir($dir, 0755, true) && !is_dir($dir)) {
+			if (!mkdir($dir, $this->getChmodDir(), true) && !is_dir($dir)) {
 				$this->fsFailure("Could not create directory: $dir");
 			}
 			return;
@@ -1649,7 +1689,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	protected function copyDirectoryRecursive($src, $dst) {
 		if (!is_dir($dst)) {
-			if (!mkdir($dst, 0755, true) && !is_dir($dst)) {
+			if (!mkdir($dst, $this->getChmodDir(), true) && !is_dir($dst)) {
 				$this->fsFailure("Could not create directory: $dst");
 				return;
 			}
@@ -1667,6 +1707,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			} else {
 				if (!copy($srcPath, $dstPath)) {
 					$this->fsFailure("Could not copy $srcPath to $dstPath");
+				} else {
+					chmod($dstPath, $this->getChmodFile());
 				}
 			}
 		}
@@ -1679,6 +1721,36 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * @param string $sitePath Absolute path to site/ directory
 	 * @return array Map of absolute path => true
 	 */
+
+	/**
+	 * Get the octal permission for directories
+	 *
+	 * Uses the module config value if set, falls back to PW's $config->chmodDir,
+	 * then to 0755 as a last resort.
+	 *
+	 * @return int Permission as integer (for chmod/mkdir)
+	 */
+	protected function getChmodDir() {
+		$val = $this->chmodDir;
+		if (empty($val)) $val = $this->wire('config')->chmodDir;
+		if (empty($val)) $val = '0755';
+		return octdec(ltrim($val, '0') ?: '755');
+	}
+
+	/**
+	 * Get the octal permission for files
+	 *
+	 * Uses the module config value if set, falls back to PW's $config->chmodFile,
+	 * then to 0644 as a last resort.
+	 *
+	 * @return int Permission as integer (for chmod)
+	 */
+	protected function getChmodFile() {
+		$val = $this->chmodFile;
+		if (empty($val)) $val = $this->wire('config')->chmodFile;
+		if (empty($val)) $val = '0644';
+		return octdec(ltrim($val, '0') ?: '644');
+	}
 	protected function parseKeepDirectories($textarea, $sitePath) {
 		$result = [];
 		$sitePath = rtrim($sitePath, '/') . '/';
