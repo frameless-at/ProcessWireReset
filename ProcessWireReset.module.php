@@ -573,6 +573,7 @@ HTMLMODAL;
 		/** @var InputfieldMarkup $f */
 		$f = $modules->get('InputfieldMarkup');
 		$f->attr('name', '_pwreset_modal');
+		$f->attr('style', 'height:0;overflow:hidden;padding:0;margin:0;border:0;');
 		$f->label = ' ';
 		$f->skipLabel = Inputfield::skipLabelHeader;
 		$f->value = $this->buildResetModalMarkup($data);
