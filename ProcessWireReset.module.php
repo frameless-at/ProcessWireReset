@@ -568,13 +568,7 @@ HTMLMODAL;
 		$f->label = $this->_('I want to reset this installation');
 		$f->description = $this->_('A confirmation dialog will show a summary of all settings before executing.');
 		$f->icon = 'exclamation-triangle';
-		$inputfields->add($f);
-
-		/** @var InputfieldMarkup $f */
-		$f = $modules->get('InputfieldMarkup');
-		$f->attr('name', '_pwreset_modal');
-		$f->collapsed = Inputfield::collapsedHidden;
-		$f->value = $this->buildResetModalMarkup($data);
+		$f->notes = $this->buildResetModalMarkup($data);
 		$inputfields->add($f);
 
 		return $inputfields;
