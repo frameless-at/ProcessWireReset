@@ -573,6 +573,7 @@ HTMLMODAL;
 		/** @var InputfieldMarkup $f */
 		$f = $modules->get('InputfieldMarkup');
 		$f->attr('name', '_pwreset_modal');
+		$f->collapsed = Inputfield::collapsedHidden;
 		$f->value = $this->buildResetModalMarkup($data);
 		$inputfields->add($f);
 
