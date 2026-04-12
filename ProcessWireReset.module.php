@@ -1238,17 +1238,19 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 			$resolved[$className] = true;
 
-			// Inspect dependencies via verbose info
 			$info = $modules->getModuleInfoVerbose($className);
-			$requires = isset($info['requires']) ? (array) $info['requires'] : [];
 
-			foreach ($requires as $req) {
-				// Strip optional version constraint: "ModuleName>=1.0.0" → "ModuleName"
+			// Follow 'requires' — modules this one depends on
+			foreach ((array) (isset($info['requires']) ? $info['requires'] : []) as $req) {
 				if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m)) {
-					$depClass = $m[1];
-					if (!isset($resolved[$depClass])) {
-						$stack[] = $depClass;
-					}
+					if (!isset($resolved[$m[1]])) $stack[] = $m[1];
+				}
+			}
+
+			// Follow 'installs' — bundled modules co-installed with this one
+			foreach ((array) (isset($info['installs']) ? $info['installs'] : []) as $coModule) {
+				if (!empty($coModule) && !isset($resolved[$coModule])) {
+					$stack[] = $coModule;
 				}
 			}
 		}
@@ -1277,8 +1279,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$modules = $this->wire('modules');
 		$selfClass = $this->className();
 
-		// Step 1: BFS through dependency graph, collecting requires info
-		$requires = [];  // class => [dep1, dep2, ...]
+		// Step 1: BFS through dependency graph, collecting requires + installs
+		$requires = [];  // class => [dep1, dep2, ...] (hard deps for topo sort)
 		$queue = array_values(array_unique($keepModules));
 
 		while (!empty($queue)) {
@@ -1293,9 +1295,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 			$info = $modules->getModuleInfoVerbose($className);
 			$deps = [];
-			$moduleRequires = isset($info['requires']) ? (array) $info['requires'] : [];
 
-			foreach ($moduleRequires as $req) {
+			// Follow 'requires' — hard dependencies that define install order
+			foreach ((array) (isset($info['requires']) ? $info['requires'] : []) as $req) {
 				if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m)) {
 					$depClass = $m[1];
 					if ($depClass === 'ProcessWire' || $depClass === 'PHP') continue;
@@ -1306,6 +1308,18 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 					}
 				}
 			}
+
+			// Follow 'installs' — bundled co-installed modules. These don't
+			// create a hard ordering constraint (the parent installs them),
+			// but they must be in the graph so their config gets backed up.
+			foreach ((array) (isset($info['installs']) ? $info['installs'] : []) as $coModule) {
+				if (empty($coModule)) continue;
+				if ($coModule === $selfClass || $coModule === 'ProcessWire' || $coModule === 'PHP') continue;
+				if (!isset($requires[$coModule])) {
+					$queue[] = $coModule;
+				}
+			}
+
 			$requires[$className] = $deps;
 		}
 
