@@ -787,9 +787,13 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Restore backed-up custom tables after the DB reset
 	 *
-	 * Recreates each table with its original CREATE TABLE statement and
-	 * re-inserts all rows. Uses FOREIGN_KEY_CHECKS=0 to avoid FK issues
-	 * with data that may reference freshly-imported canonical tables.
+	 * Only restores tables that CURRENTLY EXIST in the database — meaning
+	 * a kept module's install() just created them. Tables from previously
+	 * uninstalled/deleted modules are skipped because no install() recreated
+	 * them, so they have no owner in the current installation.
+	 *
+	 * For tables that do exist, drops the fresh (empty) version that
+	 * install() created and recreates with the original schema + data.
 	 *
 	 * @param WireDatabasePDO $database
 	 * @param array $customTables Output of backupCustomTables()
@@ -797,9 +801,26 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	protected function restoreCustomTables($database, array $customTables) {
 		if (empty($customTables)) return;
 
+		$dbName = $this->wire('config')->dbName;
 		$database->exec("SET FOREIGN_KEY_CHECKS = 0");
 
+		$restored = [];
+		$skipped = [];
+
 		foreach ($customTables as $table => $tableData) {
+			// Only restore if the table currently exists — this means a kept
+			// module's install() just created it and we have data to fill in.
+			// Tables from deleted/uninstalled modules won't exist and are skipped.
+			$stmt = $database->prepare(
+				"SELECT COUNT(*) FROM information_schema.TABLES " .
+				"WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :tbl"
+			);
+			$stmt->execute([':db' => $dbName, ':tbl' => $table]);
+			if ((int) $stmt->fetchColumn() === 0) {
+				$skipped[] = $table;
+				continue;
+			}
+
 			$database->exec("DROP TABLE IF EXISTS `$table`");
 			$database->exec($tableData['create']);
 
@@ -827,9 +848,20 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 					$this->wire('log')->error("ProcessWireReset: row insert failed for `$table`: " . $e->getMessage());
 				}
 			}
+
+			$restored[] = $table;
 		}
 
 		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
+
+		if (!empty($skipped)) {
+			$this->wire('log')->save('processwirereset',
+				"Skipped " . count($skipped) . " orphaned custom table(s) (no installed module claimed them): "
+				. implode(', ', $skipped)
+			);
+		}
+
+		return $restored;
 	}
 
 	/**
