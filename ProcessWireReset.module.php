@@ -558,20 +558,18 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$this->fsFailures[] = $sitePath . 'assets/installed.php (could not write)';
 		}
 
-		// If any filesystem operation failed, refuse to silently declare
-		// success. The DB reset has already happened so we cannot roll back,
-		// but we CAN tell the user so they don't ship a half-cleaned install.
+		// Log any filesystem failures but do NOT throw — the DB reset has
+		// already completed and there is no way to roll it back. Throwing
+		// here would block the redirect and leave the user stuck on an
+		// error page with a half-cleaned installation. Instead, log the
+		// details and continue to the login page. The user can check the
+		// log and manually remove leftover files.
 		if (!empty($this->fsFailures)) {
-			$summary = count($this->fsFailures) . ' filesystem operation(s) failed';
-			$this->wire('log')->error(
-				"ProcessWireReset: $summary:\n- " . implode("\n- ", $this->fsFailures)
-			);
-			throw new WireException(
-				"Reset finished DB phase but $summary. "
-				. "The database is clean but some files/directories could not be removed. "
-				. "Check write permissions on site/modules/, site/templates/, and site/assets/. "
-				. "Failed paths (first 10):\n- "
-				. implode("\n- ", array_slice($this->fsFailures, 0, 10))
+			$count = count($this->fsFailures);
+			$this->wire('log')->save('processwirereset',
+				"Filesystem cleanup: $count operation(s) failed. "
+				. "These files/directories could not be removed (permission issues). "
+				. "First 20:\n- " . implode("\n- ", array_slice($this->fsFailures, 0, 20))
 			);
 		}
 
