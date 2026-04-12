@@ -292,7 +292,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			<h2 class="uk-modal-title">{$modalTitle}</h2>
 		</div>
 		<div class="uk-modal-body">
-			<div class="uk-alert uk-alert-danger">
+			<div class="uk-alert">
 				{$warningText}
 			</div>
 			<table class="uk-table uk-table-divider uk-table-small uk-margin-top">
@@ -305,7 +305,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		</div>
 		<div class="uk-modal-footer uk-text-right">
 			<button type="button" class="uk-button uk-button-default uk-modal-close">{$cancelLabel}</button>
-			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-primary">
+			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-secondary">
 				<i class="fa fa-refresh"></i> {$btnLabel}
 			</button>
 		</div>
