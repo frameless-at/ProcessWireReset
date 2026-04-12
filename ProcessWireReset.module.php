@@ -283,12 +283,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$confirmText = self::CONFIRM_TEXT;
 
 		return <<<HTML
-<div id="pwreset-trigger" style="display:none; margin-top:10px;">
-	<button type="button" id="pwreset-open-modal" class="ui-button ui-state-default" style="background:#c0392b; color:#fff; border-color:#922b21;">
-		<i class="fa fa-exclamation-triangle"></i> {$btnLabel}
-	</button>
-</div>
-
 <div id="pwreset-modal" uk-modal="bg-close:false; esc-close:false;">
 	<div class="uk-modal-dialog">
 		<div class="uk-modal-header" style="background:#c0392b; color:#fff;">
@@ -322,8 +316,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 <script>
 document.addEventListener('DOMContentLoaded', function() {
 	var checkbox = document.getElementById('pwreset-enable');
-	var trigger = document.getElementById('pwreset-trigger');
-	var openBtn = document.getElementById('pwreset-open-modal');
 	var confirmBtn = document.getElementById('pwreset-confirm-btn');
 	var hiddenSubmit = document.getElementById('pwreset-hidden-submit');
 	var hiddenConfirm = document.getElementById('pwreset-hidden-confirm');
@@ -331,18 +323,19 @@ document.addEventListener('DOMContentLoaded', function() {
 	var defaultProfile = '{$defaultLabel}';
 	var noneText = '{$noneLabel}';
 	var confirmText = '{$confirmText}';
+	var confirmed = false;
 
-	if (!checkbox || !trigger || !openBtn || !confirmBtn || !modal) return;
+	if (!checkbox || !confirmBtn || !modal) return;
 
-	// Show/hide the trigger button based on checkbox
-	checkbox.addEventListener('change', function() {
-		trigger.style.display = this.checked ? 'block' : 'none';
-	});
+	// Intercept form submit: if checkbox is checked, show modal instead
+	var form = checkbox.closest('form');
+	if (!form) return;
 
-	// Populate summary and open modal
-	openBtn.addEventListener('click', function() {
-		var form = this.closest('form');
-		if (!form) return;
+	form.addEventListener('submit', function(e) {
+		if (!checkbox.checked || confirmed) return; // normal save or already confirmed
+		e.preventDefault();
+
+		// ── Populate summary from current form values ──
 
 		// Profile
 		var profileInput = form.querySelector('[name=profilePath]');
@@ -350,21 +343,21 @@ document.addEventListener('DOMContentLoaded', function() {
 		document.getElementById('pwreset-summary-profile').textContent =
 			profileVal ? profileVal : defaultProfile;
 
-		// Modules
-		var moduleSelect = form.querySelector('[name="keepModules[]"]');
+		// Modules (read from AsmSelect rendered list)
 		var moduleItems = [];
-		if (moduleSelect) {
-			for (var i = 0; i < moduleSelect.options.length; i++) {
-				if (moduleSelect.options[i].selected) {
-					moduleItems.push(moduleSelect.options[i].text || moduleSelect.options[i].value);
-				}
-			}
-		}
-		// Also check for AsmSelect items (PW renders selected items in a separate list)
 		var asmItems = form.querySelectorAll('#wrap_keepModules .asmListItem .asmListItemLabel');
 		if (asmItems.length) {
-			moduleItems = [];
 			asmItems.forEach(function(el) { moduleItems.push(el.textContent.trim()); });
+		} else {
+			// Fallback: read from the select element
+			var moduleSelect = form.querySelector('[name="keepModules[]"]');
+			if (moduleSelect) {
+				for (var i = 0; i < moduleSelect.options.length; i++) {
+					if (moduleSelect.options[i].selected) {
+						moduleItems.push(moduleSelect.options[i].text || moduleSelect.options[i].value);
+					}
+				}
+			}
 		}
 		var modulesEl = document.getElementById('pwreset-summary-modules');
 		if (moduleItems.length) {
@@ -401,23 +394,22 @@ document.addEventListener('DOMContentLoaded', function() {
 		if (chmodDir) chmodParts.push('Dirs: ' + chmodDir);
 		if (chmodFile) chmodParts.push('Files: ' + chmodFile);
 		document.getElementById('pwreset-summary-chmod').textContent =
-			chmodParts.length ? chmodParts.join(', ') : chmodDirInput.placeholder + ' / ' + chmodFileInput.placeholder + ' (defaults)';
+			chmodParts.length ? chmodParts.join(', ') :
+			(chmodDirInput ? chmodDirInput.placeholder : '0755') + ' / ' +
+			(chmodFileInput ? chmodFileInput.placeholder : '0644') + ' (defaults)';
 
-		// Open modal
 		UIkit.modal(modal).show();
 	});
 
-	// Confirm: enable hidden fields and submit
+	// Confirm: enable hidden fields, set flag, re-submit
 	confirmBtn.addEventListener('click', function() {
+		confirmed = true;
 		hiddenSubmit.value = '1';
 		hiddenSubmit.disabled = false;
 		hiddenConfirm.value = confirmText;
 		hiddenConfirm.disabled = false;
-
 		UIkit.modal(modal).hide();
-
-		var form = this.closest('form') || document.querySelector('form');
-		if (form) form.submit();
+		form.submit();
 	});
 });
 </script>
