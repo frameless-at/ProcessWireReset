@@ -1406,7 +1406,21 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	protected function fsFailure($message) {
 		$this->fsFailures[] = $message;
-		$this->wire('log')->error("ProcessWireReset: $message");
+		// Use direct file write as fallback — wire('log') may not work after
+		// silenceAutoloadModules() sets error_reporting(0).
+		try {
+			$this->wire('log')->save('processwirereset', $message);
+		} catch (\Exception $e) {
+			// Fallback: write directly to log file
+			$logDir = $this->wire('config')->paths->assets . 'logs/';
+			if (is_dir($logDir)) {
+				@file_put_contents(
+					$logDir . 'processwirereset.txt',
+					date('Y-m-d H:i:s') . " $message\n",
+					FILE_APPEND
+				);
+			}
+		}
 	}
 
 	/**
@@ -1506,17 +1520,21 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			return;
 		}
 
-		$iterator = new \DirectoryIterator($dir);
-		foreach ($iterator as $item) {
-			if ($item->isDot()) continue;
-			$path = $item->getPathname();
-			if ($item->isDir()) {
-				$this->removeDirectoryRecursive($path);
-			} else {
-				if (!unlink($path)) {
-					$this->fsFailure("Could not delete file: $path");
+		try {
+			$iterator = new \DirectoryIterator($dir);
+			foreach ($iterator as $item) {
+				if ($item->isDot()) continue;
+				$path = $item->getPathname();
+				if ($item->isDir()) {
+					$this->removeDirectoryRecursive($path);
+				} else {
+					if (!unlink($path)) {
+						$this->fsFailure("Could not delete file: $path");
+					}
 				}
 			}
+		} catch (\Exception $e) {
+			$this->fsFailure("Could not iterate directory $dir: " . $e->getMessage());
 		}
 	}
 
@@ -1530,17 +1548,22 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	protected function removeDirectoryRecursive($dir) {
 		if (!is_dir($dir)) return;
 
-		$items = new \RecursiveIteratorIterator(
-			new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
-			\RecursiveIteratorIterator::CHILD_FIRST
-		);
+		try {
+			$items = new \RecursiveIteratorIterator(
+				new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
+				\RecursiveIteratorIterator::CHILD_FIRST
+			);
 
-		foreach ($items as $item) {
-			$path = $item->getPathname();
-			$ok = $item->isDir() ? rmdir($path) : unlink($path);
-			if (!$ok) {
-				$this->fsFailure("Could not remove: $path");
+			foreach ($items as $item) {
+				$path = $item->getPathname();
+				$ok = $item->isDir() ? rmdir($path) : unlink($path);
+				if (!$ok) {
+					$this->fsFailure("Could not remove: $path");
+				}
 			}
+		} catch (\Exception $e) {
+			$this->fsFailure("Could not iterate directory $dir: " . $e->getMessage());
+			return;
 		}
 
 		if (!rmdir($dir)) {
