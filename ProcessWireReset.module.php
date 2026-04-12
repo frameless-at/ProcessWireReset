@@ -560,27 +560,21 @@ HTMLMODAL;
 
 		// ── Execute Reset ────────────────────────────────────────────────
 
-		/** @var InputfieldFieldset $fs */
-		$fs = $modules->get('InputfieldFieldset');
-		$fs->label = $this->_('Execute Reset');
-		$fs->icon = 'exclamation-triangle';
-		$inputfields->add($fs);
-
 		/** @var InputfieldCheckbox $f */
 		$f = $modules->get('InputfieldCheckbox');
 		$f->attr('name', 'enableReset');
 		$f->attr('id', 'pwreset-enable');
 		$f->attr('value', 1);
 		$f->label = $this->_('I want to reset this installation');
-		$f->description = $this->_('Check this box to reveal the reset button. A confirmation dialog will show a summary of all settings before executing.');
-		$fs->add($f);
+		$f->description = $this->_('A confirmation dialog will show a summary of all settings before executing.');
+		$f->icon = 'exclamation-triangle';
+		$inputfields->add($f);
 
-		// Hidden fields submitted by the modal JS
 		/** @var InputfieldMarkup $f */
 		$f = $modules->get('InputfieldMarkup');
 		$f->attr('name', '_pwreset_modal');
 		$f->value = $this->buildResetModalMarkup($data);
-		$fs->add($f);
+		$inputfields->add($f);
 
 		return $inputfields;
 	}
