@@ -11,7 +11,7 @@
  */
 class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
-	const CONFIRM_TEXT = 'RESET';
+	const CONFIRM_TEXT = 'CONFIRMED';
 	const PENDING_FILE = '.pending-installs.json';
 	const PENDING_TABLES_FILE = '.pending-custom-tables.bin';
 
@@ -259,11 +259,176 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Build the HTML for the reset confirmation modal
+	 *
+	 * The modal shows a summary of the current settings (profile, kept modules,
+	 * kept directories, chmod) and a danger-styled "Execute Reset" button.
+	 * JavaScript reads the current form values, populates the summary, and
+	 * submits the form with hidden fields on confirmation.
+	 *
+	 * @param array $data Current config data
+	 * @return string HTML + JS for the modal
+	 */
+	private function buildResetModalMarkup(array $data) {
+		$btnLabel = $this->_('Execute Reset');
+		$cancelLabel = $this->_('Cancel');
+		$modalTitle = $this->_('Confirm Installation Reset');
+		$warningText = $this->_('This will permanently delete all content, fields, templates, uploaded files, and non-kept modules. The current superuser account will be preserved. This action cannot be undone!');
+		$profileLabel = $this->_('Profile');
+		$modulesLabel = $this->_('Modules to keep');
+		$dirsLabel = $this->_('Directories to keep');
+		$chmodLabel = $this->_('Permissions');
+		$noneLabel = $this->_('None');
+		$defaultLabel = $this->_('Bundled default (site-blank)');
+		$confirmText = self::CONFIRM_TEXT;
+
+		return <<<HTML
+<div id="pwreset-trigger" style="display:none; margin-top:10px;">
+	<button type="button" id="pwreset-open-modal" class="ui-button ui-state-default" style="background:#c0392b; color:#fff; border-color:#922b21;">
+		<i class="fa fa-exclamation-triangle"></i> {$btnLabel}
+	</button>
+</div>
+
+<div id="pwreset-modal" uk-modal="bg-close:false; esc-close:false;">
+	<div class="uk-modal-dialog">
+		<div class="uk-modal-header" style="background:#c0392b; color:#fff;">
+			<h2 class="uk-modal-title" style="color:#fff;">
+				<i class="fa fa-exclamation-triangle"></i> {$modalTitle}
+			</h2>
+		</div>
+		<div class="uk-modal-body">
+			<div class="uk-alert uk-alert-danger" style="font-weight:bold;">
+				{$warningText}
+			</div>
+			<table class="uk-table uk-table-divider uk-table-small uk-margin-top">
+				<tr><th style="width:180px">{$profileLabel}</th><td id="pwreset-summary-profile"></td></tr>
+				<tr><th>{$modulesLabel}</th><td id="pwreset-summary-modules"></td></tr>
+				<tr><th>{$dirsLabel}</th><td id="pwreset-summary-dirs"></td></tr>
+				<tr><th>{$chmodLabel}</th><td id="pwreset-summary-chmod"></td></tr>
+			</table>
+		</div>
+		<div class="uk-modal-footer uk-text-right">
+			<button type="button" class="uk-button uk-button-default uk-modal-close">{$cancelLabel}</button>
+			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-danger">
+				<i class="fa fa-refresh"></i> {$btnLabel}
+			</button>
+		</div>
+	</div>
+</div>
+
+<input type="hidden" name="submit_reset" id="pwreset-hidden-submit" value="" disabled>
+<input type="hidden" name="confirmReset" id="pwreset-hidden-confirm" value="" disabled>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+	var checkbox = document.getElementById('pwreset-enable');
+	var trigger = document.getElementById('pwreset-trigger');
+	var openBtn = document.getElementById('pwreset-open-modal');
+	var confirmBtn = document.getElementById('pwreset-confirm-btn');
+	var hiddenSubmit = document.getElementById('pwreset-hidden-submit');
+	var hiddenConfirm = document.getElementById('pwreset-hidden-confirm');
+	var modal = document.getElementById('pwreset-modal');
+	var defaultProfile = '{$defaultLabel}';
+	var noneText = '{$noneLabel}';
+	var confirmText = '{$confirmText}';
+
+	if (!checkbox || !trigger || !openBtn || !confirmBtn || !modal) return;
+
+	// Show/hide the trigger button based on checkbox
+	checkbox.addEventListener('change', function() {
+		trigger.style.display = this.checked ? 'block' : 'none';
+	});
+
+	// Populate summary and open modal
+	openBtn.addEventListener('click', function() {
+		var form = this.closest('form');
+		if (!form) return;
+
+		// Profile
+		var profileInput = form.querySelector('[name=profilePath]');
+		var profileVal = profileInput ? profileInput.value.trim() : '';
+		document.getElementById('pwreset-summary-profile').textContent =
+			profileVal ? profileVal : defaultProfile;
+
+		// Modules
+		var moduleSelect = form.querySelector('[name="keepModules[]"]');
+		var moduleItems = [];
+		if (moduleSelect) {
+			for (var i = 0; i < moduleSelect.options.length; i++) {
+				if (moduleSelect.options[i].selected) {
+					moduleItems.push(moduleSelect.options[i].text || moduleSelect.options[i].value);
+				}
+			}
+		}
+		// Also check for AsmSelect items (PW renders selected items in a separate list)
+		var asmItems = form.querySelectorAll('#wrap_keepModules .asmListItem .asmListItemLabel');
+		if (asmItems.length) {
+			moduleItems = [];
+			asmItems.forEach(function(el) { moduleItems.push(el.textContent.trim()); });
+		}
+		var modulesEl = document.getElementById('pwreset-summary-modules');
+		if (moduleItems.length) {
+			modulesEl.innerHTML = '<ul class="uk-list uk-list-bullet uk-margin-remove">' +
+				moduleItems.map(function(m) { return '<li>' + m + '</li>'; }).join('') + '</ul>';
+		} else {
+			modulesEl.textContent = noneText;
+		}
+
+		// Directories
+		var dirsInput = form.querySelector('[name=keepDirectories]');
+		var dirsVal = dirsInput ? dirsInput.value.trim() : '';
+		var dirsEl = document.getElementById('pwreset-summary-dirs');
+		if (dirsVal) {
+			var dirLines = dirsVal.split('\\n').filter(function(l) {
+				return l.trim() && l.trim()[0] !== '#';
+			});
+			if (dirLines.length) {
+				dirsEl.innerHTML = '<ul class="uk-list uk-list-bullet uk-margin-remove">' +
+					dirLines.map(function(d) { return '<li><code>' + d.trim() + '</code></li>'; }).join('') + '</ul>';
+			} else {
+				dirsEl.textContent = noneText;
+			}
+		} else {
+			dirsEl.textContent = noneText;
+		}
+
+		// Chmod
+		var chmodDirInput = form.querySelector('[name=chmodDir]');
+		var chmodFileInput = form.querySelector('[name=chmodFile]');
+		var chmodDir = chmodDirInput ? chmodDirInput.value.trim() : '';
+		var chmodFile = chmodFileInput ? chmodFileInput.value.trim() : '';
+		var chmodParts = [];
+		if (chmodDir) chmodParts.push('Dirs: ' + chmodDir);
+		if (chmodFile) chmodParts.push('Files: ' + chmodFile);
+		document.getElementById('pwreset-summary-chmod').textContent =
+			chmodParts.length ? chmodParts.join(', ') : chmodDirInput.placeholder + ' / ' + chmodFileInput.placeholder + ' (defaults)';
+
+		// Open modal
+		UIkit.modal(modal).show();
+	});
+
+	// Confirm: enable hidden fields and submit
+	confirmBtn.addEventListener('click', function() {
+		hiddenSubmit.value = '1';
+		hiddenSubmit.disabled = false;
+		hiddenConfirm.value = confirmText;
+		hiddenConfirm.disabled = false;
+
+		UIkit.modal(modal).hide();
+
+		var form = this.closest('form') || document.querySelector('form');
+		if (form) form.submit();
+	});
+});
+</script>
+HTML;
+	}
+
+	/**
 	 * Detect and execute the reset action from POST data
 	 *
-	 * If the user clicked the "Reset Installation" button and supplied the
-	 * confirmation text, executeReset() is called. executeReset() ends the
-	 * request via exit(), so this method does not return on success.
+	 * The modal sets two hidden fields: submit_reset=1 and confirmReset=CONFIRMED.
+	 * Both must be present for the reset to proceed.
 	 *
 	 * @param array $data Saved config data
 	 */
@@ -271,14 +436,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$input = $this->wire('input');
 		if (!$input->requestMethod('POST')) return;
 		if ($input->post('submit_reset') === null) return;
+		if ($input->post('confirmReset') !== self::CONFIRM_TEXT) return;
 
-		if ($input->post('confirmReset') === self::CONFIRM_TEXT) {
-			$this->executeReset($data);
-			// executeReset() exits — control never reaches here on success
-			return;
-		}
-
-		$this->error($this->_('Confirmation text did not match. Reset was not executed.'));
+		$this->executeReset($data);
 	}
 
 	/**
@@ -407,22 +567,22 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$fs = $modules->get('InputfieldFieldset');
 		$fs->label = $this->_('Execute Reset');
 		$fs->icon = 'exclamation-triangle';
-		$fs->description = $this->_('WARNING: This will permanently delete all content, fields, templates, uploaded files, and non-kept modules. The current superuser account will be preserved. This action cannot be undone!');
 		$inputfields->add($fs);
 
-		/** @var InputfieldText $f */
-		$f = $modules->get('InputfieldText');
-		$f->attr('name', 'confirmReset');
-		$f->attr('value', '');
-		$f->label = $this->_('Confirmation');
-		$f->description = sprintf($this->_('Type %s to confirm the reset.'), '"' . self::CONFIRM_TEXT . '"');
+		/** @var InputfieldCheckbox $f */
+		$f = $modules->get('InputfieldCheckbox');
+		$f->attr('name', 'enableReset');
+		$f->attr('id', 'pwreset-enable');
+		$f->attr('value', 1);
+		$f->label = $this->_('I want to reset this installation');
+		$f->description = $this->_('Check this box to reveal the reset button. A confirmation dialog will show a summary of all settings before executing.');
 		$fs->add($f);
 
-		/** @var InputfieldSubmit $f */
-		$f = $modules->get('InputfieldSubmit');
-		$f->attr('name', 'submit_reset');
-		$f->attr('value', $this->_('Reset Installation'));
-		$f->icon = 'refresh';
+		// Hidden fields submitted by the modal JS
+		/** @var InputfieldMarkup $f */
+		$f = $modules->get('InputfieldMarkup');
+		$f->attr('name', '_pwreset_modal');
+		$f->value = $this->buildResetModalMarkup($data);
 		$fs->add($f);
 
 		return $inputfields;
