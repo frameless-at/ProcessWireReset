@@ -485,9 +485,34 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$rawKeepDirs = $input->post('keepDirectories');
 		$data['keepDirectories'] = ($rawKeepDirs !== null) ? (string) $rawKeepDirs : '';
 
+		// Read chmod fields from POST
+		$rawChmodDir = $input->post('chmodDir');
+		$data['chmodDir'] = ($rawChmodDir !== null) ? (string) $rawChmodDir : '';
+		$rawChmodFile = $input->post('chmodFile');
+		$data['chmodFile'] = ($rawChmodFile !== null) ? (string) $rawChmodFile : '';
+
 		// Automatically include all transitive site-module dependencies so
 		// preserving Module A also preserves the modules it requires.
 		$data['keepModules'] = $this->expandKeepModules((array) $data['keepModules']);
+
+		// Persist current config to DB BEFORE backup. When the user clicks
+		// "Reset Installation" without first clicking the main Submit button,
+		// PW's config save flow never runs (executeReset exits before it).
+		// Without this, backupModuleData reads the OLD saved config and the
+		// module's settings are lost after the reset.
+		try {
+			$selfConfig = json_encode([
+				'profilePath' => $data['profilePath'],
+				'keepModules' => $data['keepModules'],
+				'keepDirectories' => $data['keepDirectories'],
+				'chmodDir' => $data['chmodDir'],
+				'chmodFile' => $data['chmodFile'],
+			]);
+			$database->prepare("UPDATE modules SET data = :data WHERE class = :class")
+				->execute([':data' => $selfConfig, ':class' => $this->className()]);
+		} catch (\PDOException $e) {
+			// Non-fatal — worst case the settings reset to defaults
+		}
 
 		// ── Phase 0: Pre-flight checks ───────────────────────────────────
 		//
