@@ -360,7 +360,7 @@ document.addEventListener('DOMContentLoaded', function() {
 		}
 		var modulesEl = document.getElementById('pwreset-summary-modules');
 		if (moduleItems.length) {
-			modulesEl.innerHTML = '<ul class="uk-list uk-list-bullet uk-margin-remove">' +
+			modulesEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
 				moduleItems.map(function(m) { return '<li>' + m + '</li>'; }).join('') + '</ul>';
 		} else {
 			modulesEl.textContent = noneText;
@@ -371,7 +371,7 @@ document.addEventListener('DOMContentLoaded', function() {
 		var depsEl = document.getElementById('pwreset-summary-deps');
 		if (precomputedDeps.length > 0) {
 			depsRow.style.display = '';
-			depsEl.innerHTML = '<ul class="uk-list uk-list-bullet uk-margin-remove">' +
+			depsEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
 				precomputedDeps.map(function(d) { return '<li>' + d + '</li>'; }).join('') + '</ul>';
 		} else {
 			depsRow.style.display = 'none';
@@ -386,7 +386,7 @@ document.addEventListener('DOMContentLoaded', function() {
 				return l.trim() && l.trim()[0] !== '#';
 			});
 			if (dirLines.length) {
-				dirsEl.innerHTML = '<ul class="uk-list uk-list-bullet uk-margin-remove">' +
+				dirsEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
 					dirLines.map(function(d) { return '<li><code>' + d.trim() + '</code></li>'; }).join('') + '</ul>';
 			} else {
 				dirsEl.textContent = noneText;
