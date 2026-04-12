@@ -748,10 +748,14 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Back up all tables not present in the install.sql files
+	 * Back up non-canonical tables that are still legitimate
 	 *
-	 * Dumps structure (CREATE TABLE) and all rows so they can be
-	 * recreated after the reset.
+	 * Backs up custom tables (not in install.sql) that should survive the
+	 * reset. For field_* tables, cross-references the `fields` table: only
+	 * fields with a registered entry are backed up. Orphaned field tables
+	 * (from modules that were uninstalled but didn't clean up their tables)
+	 * are skipped. Non-field tables (fieldtype_options, pages_meta, etc.)
+	 * are always backed up.
 	 *
 	 * @param WireDatabasePDO $database
 	 * @param array $canonicalTables Map of table_name => true from getCanonicalTables
@@ -761,8 +765,28 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$backup = [];
 		$allTables = $database->query("SHOW TABLES")->fetchAll(\PDO::FETCH_COLUMN);
 
+		// Build a set of legitimate field_* table names by querying the
+		// fields table BEFORE the reset. Every registered field has a
+		// corresponding field_<name> table. Unregistered field tables are
+		// orphans from improperly uninstalled modules.
+		$registeredFieldTables = [];
+		try {
+			$stmt = $database->query("SELECT name FROM fields");
+			while ($name = $stmt->fetchColumn()) {
+				$registeredFieldTables['field_' . $name] = true;
+			}
+		} catch (\PDOException $e) {
+			// If fields table is unreadable, skip the filter — back up everything
+		}
+
 		foreach ($allTables as $table) {
 			if (isset($canonicalTables[$table])) continue;
+
+			// For field_* tables: only back up if the field is registered in
+			// the fields table. Unregistered = orphaned from deleted module.
+			if (strpos($table, 'field_') === 0 && !empty($registeredFieldTables)) {
+				if (!isset($registeredFieldTables[$table])) continue;
+			}
 
 			$createSql = $this->getCreateTable($database, $table);
 			if (empty($createSql)) continue;
@@ -773,7 +797,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				$stmt = $database->query("SELECT * FROM `$safeTable`");
 				$rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 			} catch (\PDOException $e) {
-				// Skip tables we can't read
 				continue;
 			}
 
@@ -789,40 +812,25 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Restore backed-up custom tables after the DB reset
 	 *
-	 * Only restores tables that CURRENTLY EXIST in the database — meaning
-	 * a kept module's install() just created them. Tables from previously
-	 * uninstalled/deleted modules are skipped because no install() recreated
-	 * them, so they have no owner in the current installation.
+	 * Unconditionally restores every table in the backup. Orphan filtering
+	 * has already happened in backupCustomTables() by cross-referencing the
+	 * `fields` table — so everything in the backup is legitimate.
 	 *
-	 * For tables that do exist, drops the fresh (empty) version that
-	 * install() created and recreates with the original schema + data.
+	 * Uses DROP IF EXISTS + CREATE to overwrite any empty version that a
+	 * module's install() may have just created with the backed-up data.
 	 *
 	 * @param WireDatabasePDO $database
 	 * @param array $customTables Output of backupCustomTables()
+	 * @return array List of restored table names
 	 */
 	protected function restoreCustomTables($database, array $customTables) {
-		if (empty($customTables)) return;
+		if (empty($customTables)) return [];
 
-		$dbName = $this->wire('config')->dbName;
 		$database->exec("SET FOREIGN_KEY_CHECKS = 0");
 
 		$restored = [];
-		$skipped = [];
 
 		foreach ($customTables as $table => $tableData) {
-			// Only restore if the table currently exists — this means a kept
-			// module's install() just created it and we have data to fill in.
-			// Tables from deleted/uninstalled modules won't exist and are skipped.
-			$stmt = $database->prepare(
-				"SELECT COUNT(*) FROM information_schema.TABLES " .
-				"WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :tbl"
-			);
-			$stmt->execute([':db' => $dbName, ':tbl' => $table]);
-			if ((int) $stmt->fetchColumn() === 0) {
-				$skipped[] = $table;
-				continue;
-			}
-
 			$database->exec("DROP TABLE IF EXISTS `$table`");
 			$database->exec($tableData['create']);
 
@@ -855,13 +863,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		}
 
 		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
-
-		if (!empty($skipped)) {
-			$this->wire('log')->save('processwirereset',
-				"Skipped " . count($skipped) . " orphaned custom table(s) (no installed module claimed them): "
-				. implode(', ', $skipped)
-			);
-		}
 
 		return $restored;
 	}
