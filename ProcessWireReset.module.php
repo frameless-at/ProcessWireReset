@@ -227,11 +227,13 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		if (!is_array($customTables) || empty($customTables)) return;
 
 		try {
-			$this->restoreCustomTables($database, $customTables);
-			$this->wire('log')->save(
-				'processwirereset',
-				'Restored custom tables: ' . implode(', ', array_keys($customTables))
-			);
+			$restored = $this->restoreCustomTables($database, $customTables);
+			if (!empty($restored)) {
+				$this->wire('log')->save(
+					'processwirereset',
+					'Restored custom tables: ' . implode(', ', $restored)
+				);
+			}
 		} catch (\Exception $e) {
 			$this->wire('log')->error(
 				'ProcessWireReset: Custom table restore failed: ' . $e->getMessage()
