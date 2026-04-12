@@ -300,7 +300,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				<tr><th>{$modulesLabel}</th><td id="pwreset-summary-modules"></td></tr>
 				<tr id="pwreset-deps-row" style="display:none"><th>{$depsLabel}</th><td id="pwreset-summary-deps"></td></tr>
 				<tr><th>{$dirsLabel}</th><td id="pwreset-summary-dirs"></td></tr>
-				<tr><th>{$chmodLabel}</th><td id="pwreset-summary-chmod"></td></tr>
+				<tr style="border-bottom:none"><th>{$chmodLabel}</th><td id="pwreset-summary-chmod"></td></tr>
 			</table>
 		</div>
 		<div class="uk-modal-footer uk-text-right">
