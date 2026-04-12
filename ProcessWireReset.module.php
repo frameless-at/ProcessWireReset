@@ -568,6 +568,7 @@ HTMLMODAL;
 		$f->label = $this->_('I want to reset this installation');
 		$f->description = $this->_('A confirmation dialog will show a summary of all settings before executing.');
 		$f->icon = 'exclamation-triangle';
+		$f->entityEncodeText = false;
 		$f->notes = $this->buildResetModalMarkup($data);
 		$inputfields->add($f);
 
