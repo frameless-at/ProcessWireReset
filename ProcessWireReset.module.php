@@ -286,13 +286,13 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		return <<<HTMLMODAL
 <div id="pwreset-modal" uk-modal="bg-close:false; esc-close:false;">
-	<div class="uk-modal-dialog">
+	<div class="uk-modal-dialog" style="background:#fff;">
 		<button class="uk-modal-close-default" type="button" uk-close></button>
 		<div class="uk-modal-header">
 			<h2 class="uk-modal-title">{$modalTitle}</h2>
 		</div>
 		<div class="uk-modal-body">
-			<div class="uk-alert">
+			<div class="uk-alert uk-alert-danger">
 				{$warningText}
 			</div>
 			<table class="uk-table uk-table-divider uk-table-small uk-margin-top">
