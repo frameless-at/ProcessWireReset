@@ -50,6 +50,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		parent::__construct();
 		$this->set('profilePath', '');
 		$this->set('keepModules', []);
+		$this->set('keepDirectories', '');
 	}
 
 	/**
@@ -287,6 +288,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$data = array_merge([
 			'profilePath' => '',
 			'keepModules' => [],
+			'keepDirectories' => '',
 		], $data);
 
 		$modules = $this->wire('modules');
@@ -340,6 +342,25 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$f->attr('value', $data['keepModules']);
 		$fs->add($f);
 
+		// ── Directories to Keep ──────────────────────────────────────────
+
+		/** @var InputfieldFieldset $fs */
+		$fs = $modules->get('InputfieldFieldset');
+		$fs->label = $this->_('Directories to Keep');
+		$fs->icon = 'folder-o';
+		$inputfields->add($fs);
+
+		/** @var InputfieldTextarea $f */
+		$f = $modules->get('InputfieldTextarea');
+		$f->attr('name', 'keepDirectories');
+		$f->attr('value', $data['keepDirectories']);
+		$f->attr('rows', 5);
+		$f->label = $this->_('Additional directories to preserve during reset');
+		$f->description = $this->_('One path per line, relative to the site/ directory. These directories and their contents will not be deleted.');
+		$f->notes = $this->_("Examples:\ntemplates/RockIcons\nassets/TracyDebugger\nassets/backups");
+		$f->collapsed = Inputfield::collapsedBlank;
+		$fs->add($f);
+
 		// ── Execute Reset ────────────────────────────────────────────────
 
 		/** @var InputfieldFieldset $fs */
@@ -388,6 +409,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$data = array_merge([
 			'profilePath' => '',
 			'keepModules' => [],
+			'keepDirectories' => '',
 		], $data);
 
 		$database = $this->wire('database');
@@ -416,6 +438,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			// null, empty string, or unexpected type → nothing selected
 			$data['keepModules'] = [];
 		}
+
+		// Read keepDirectories from POST (textarea, one path per line)
+		$rawKeepDirs = $input->post('keepDirectories');
+		$data['keepDirectories'] = ($rawKeepDirs !== null) ? (string) $rawKeepDirs : '';
 
 		// Automatically include all transitive site-module dependencies so
 		// preserving Module A also preserves the modules it requires.
@@ -535,14 +561,20 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// redirect step so the user sees a clear failure message.
 		$this->fsFailures = [];
 
+		// Parse the keepDirectories textarea into a set of absolute paths
+		// that the cleanup helpers will skip.
+		$keepDirPaths = $this->parseKeepDirectories($data['keepDirectories'], $sitePath);
+
 		// Clean site/assets/ — empties the four standard dirs (files, cache,
 		// logs, sessions) and removes any other entries that modules may
 		// have created (e.g. assets/TracyDebugger/, assets/backups/,
-		// assets/FormBuilder/). Keeps installed.php and index.php.
-		$this->cleanAssetsDirectory($sitePath . 'assets/');
+		// assets/FormBuilder/). Keeps installed.php, index.php, and any
+		// paths listed in keepDirectories.
+		$this->cleanAssetsDirectory($sitePath . 'assets/', $keepDirPaths);
 
-		// Reset templates to profile state
-		$this->emptyDirectory($sitePath . 'templates/');
+		// Reset templates to profile state — preserving any keepDirectories
+		// entries that live under templates/
+		$this->emptyDirectory($sitePath . 'templates/', $keepDirPaths);
 		if ($profileTemplatesPath && is_dir($profileTemplatesPath)) {
 			$this->copyDirectoryRecursive($profileTemplatesPath, $sitePath . 'templates/');
 		}
@@ -1508,11 +1540,13 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Empty a directory (remove all contents but keep the directory itself)
 	 *
-	 * Failures are tracked in $this->fsFailures and raised by Phase 3.
+	 * Skips any paths listed in $keepDirPaths. Failures are tracked in
+	 * $this->fsFailures.
 	 *
 	 * @param string $dir
+	 * @param array $keepDirPaths Map of absolute paths to preserve (optional)
 	 */
-	protected function emptyDirectory($dir) {
+	protected function emptyDirectory($dir, array $keepDirPaths = []) {
 		if (!is_dir($dir)) {
 			if (!mkdir($dir, 0755, true) && !is_dir($dir)) {
 				$this->fsFailure("Could not create directory: $dir");
@@ -1525,6 +1559,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			foreach ($iterator as $item) {
 				if ($item->isDot()) continue;
 				$path = $item->getPathname();
+				if ($this->isKeptPath($path, $keepDirPaths)) continue;
 				if ($item->isDir()) {
 					$this->removeDirectoryRecursive($path);
 				} else {
@@ -1603,13 +1638,62 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Parse the keepDirectories textarea into a set of absolute paths
+	 *
+	 * @param string $textarea Raw textarea content (one path per line)
+	 * @param string $sitePath Absolute path to site/ directory
+	 * @return array Map of absolute path => true
+	 */
+	protected function parseKeepDirectories($textarea, $sitePath) {
+		$result = [];
+		$sitePath = rtrim($sitePath, '/') . '/';
+
+		foreach (explode("\n", (string) $textarea) as $line) {
+			$line = trim($line);
+			if ($line === '' || $line[0] === '#') continue; // skip blanks and comments
+
+			// Normalize: strip leading site/, leading/trailing slashes
+			$line = preg_replace('#^site/#', '', $line);
+			$line = trim($line, '/');
+			if ($line === '') continue;
+
+			$absPath = $sitePath . $line;
+			$result[rtrim($absPath, '/')]  = true;
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Check if a path is inside any of the keep-directory paths
+	 *
+	 * @param string $path Absolute path to check
+	 * @param array $keepDirPaths Map of absolute path => true
+	 * @return bool
+	 */
+	protected function isKeptPath($path, array $keepDirPaths) {
+		if (empty($keepDirPaths)) return false;
+		$path = rtrim($path, '/');
+
+		// Exact match or is a parent/child of a kept path
+		if (isset($keepDirPaths[$path])) return true;
+		foreach ($keepDirPaths as $kept => $v) {
+			// $path is inside a kept dir
+			if (strpos($path, $kept . '/') === 0) return true;
+			// $path IS a parent of a kept dir (don't delete parent!)
+			if (strpos($kept, $path . '/') === 0) return true;
+		}
+		return false;
+	}
+
+	/**
 	 * Clean site/assets/ — empty the standard dirs, wipe everything else
 	 *
 	 * The four standard PW dirs (files, cache, logs, sessions) have their
 	 * contents emptied but the directories themselves are preserved. Any
 	 * other entry in site/assets/ (files or directories created by modules,
 	 * e.g. TracyDebugger/, backups/, FormBuilder/, SearchEngine/) is
-	 * removed entirely.
+	 * removed entirely — unless listed in $keepDirPaths.
 	 *
 	 * Preserved as-is (not touched):
 	 *   - installed.php (we rewrite it afterwards anyway)
@@ -1617,8 +1701,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 *   - .htaccess (apache config)
 	 *
 	 * @param string $assetsDir Path to site/assets/
+	 * @param array $keepDirPaths Map of absolute paths to preserve
 	 */
-	protected function cleanAssetsDirectory($assetsDir) {
+	protected function cleanAssetsDirectory($assetsDir, array $keepDirPaths = []) {
 		if (!is_dir($assetsDir)) return;
 
 		$standardDirs = ['files', 'cache', 'logs', 'sessions'];
@@ -1631,12 +1716,12 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$name = $item->getFilename();
 			$path = $item->getPathname();
 
+			if ($this->isKeptPath($path, $keepDirPaths)) continue;
+
 			if ($item->isDir()) {
 				if (in_array($name, $standardDirs, true)) {
-					// Empty the standard dir but keep the directory itself
-					$this->emptyDirectory($path);
+					$this->emptyDirectory($path, $keepDirPaths);
 				} else {
-					// Unknown dir (module-created) — remove entirely
 					$this->removeDirectoryRecursive($path);
 				}
 			} else {
