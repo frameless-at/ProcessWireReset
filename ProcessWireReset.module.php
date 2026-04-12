@@ -262,7 +262,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * Build the HTML for the reset confirmation modal
 	 *
 	 * @param array $data Current config data
-	 * @return string HTML + JS for the modal
+	 * @return array ['html' => modal div + hidden fields, 'script' => script tag]
 	 */
 	private function buildResetModalMarkup(array $data) {
 		$btnLabel = $this->_('Execute Reset');
@@ -284,7 +284,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$deps = array_values(array_diff($expanded, $savedKeep));
 		$depsJson = json_encode($deps);
 
-		return <<<HTMLMODAL
+		$html = <<<HTMLMODAL
 <div id="pwreset-modal" uk-modal="bg-close:false; esc-close:false;">
 	<div class="uk-modal-dialog" style="background:#fff;">
 		<button class="uk-modal-close-default" type="button" uk-close></button>
@@ -315,6 +315,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 <input type="hidden" name="submit_reset" id="pwreset-hidden-submit" value="" disabled>
 <input type="hidden" name="confirmReset" id="pwreset-hidden-confirm" value="" disabled>
 
+HTMLMODAL;
+
+		$script = <<<HTMLSCRIPT
 <script>
 document.addEventListener('DOMContentLoaded', function() {
 	var checkbox = document.getElementById('pwreset-enable');
@@ -418,7 +421,9 @@ document.addEventListener('DOMContentLoaded', function() {
 	});
 });
 </script>
-HTMLMODAL;
+HTMLSCRIPT;
+
+		return ['html' => $html, 'script' => $script];
 	}
 
 	/**
@@ -568,6 +573,9 @@ HTMLMODAL;
 		$f->label = $this->_('I want to reset this installation');
 		$f->description = $this->_('A confirmation dialog will show a summary of all settings before executing.');
 		$f->icon = 'exclamation-triangle';
+		$f->entityEncodeText = false;
+		$modalParts = $this->buildResetModalMarkup($data);
+		$f->notes = $modalParts['script'];
 		$inputfields->add($f);
 
 		/** @var InputfieldMarkup $f */
@@ -576,7 +584,7 @@ HTMLMODAL;
 		$f->attr('style', 'height:0;overflow:hidden;padding:0;margin:0;border:0;');
 		$f->label = ' ';
 		$f->skipLabel = Inputfield::skipLabelHeader;
-		$f->value = $this->buildResetModalMarkup($data);
+		$f->value = $modalParts['html'];
 		$inputfields->add($f);
 
 		return $inputfields;
