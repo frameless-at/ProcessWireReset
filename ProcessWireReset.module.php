@@ -261,11 +261,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Build the HTML for the reset confirmation modal
 	 *
-	 * The modal shows a summary of the current settings (profile, kept modules,
-	 * kept directories, chmod) and a danger-styled "Execute Reset" button.
-	 * JavaScript reads the current form values, populates the summary, and
-	 * submits the form with hidden fields on confirmation.
-	 *
 	 * @param array $data Current config data
 	 * @return string HTML + JS for the modal
 	 */
@@ -276,34 +271,42 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$warningText = $this->_('This will permanently delete all content, fields, templates, uploaded files, and non-kept modules. The current superuser account will be preserved. This action cannot be undone!');
 		$profileLabel = $this->_('Profile');
 		$modulesLabel = $this->_('Modules to keep');
+		$depsLabel = $this->_('Auto-included dependencies');
 		$dirsLabel = $this->_('Directories to keep');
 		$chmodLabel = $this->_('Permissions');
 		$noneLabel = $this->_('None');
 		$defaultLabel = $this->_('Bundled default (site-blank)');
 		$confirmText = self::CONFIRM_TEXT;
 
-		return <<<HTML
+		// Pre-compute transitive dependencies so JS can show them
+		$savedKeep = isset($data['keepModules']) ? (array) $data['keepModules'] : [];
+		$expanded = $this->expandKeepModules($savedKeep);
+		$deps = array_values(array_diff($expanded, $savedKeep));
+		$depsJson = json_encode($deps);
+
+		return <<<HTMLMODAL
 <div id="pwreset-modal" uk-modal="bg-close:false; esc-close:false;">
 	<div class="uk-modal-dialog">
-		<div class="uk-modal-header" style="background:#c0392b; color:#fff;">
-			<h2 class="uk-modal-title" style="color:#fff;">
+		<div class="uk-modal-header">
+			<h2 class="uk-modal-title">
 				<i class="fa fa-exclamation-triangle"></i> {$modalTitle}
 			</h2>
 		</div>
 		<div class="uk-modal-body">
-			<div class="uk-alert uk-alert-danger" style="font-weight:bold;">
+			<div class="uk-alert uk-alert-danger">
 				{$warningText}
 			</div>
 			<table class="uk-table uk-table-divider uk-table-small uk-margin-top">
 				<tr><th style="width:180px">{$profileLabel}</th><td id="pwreset-summary-profile"></td></tr>
 				<tr><th>{$modulesLabel}</th><td id="pwreset-summary-modules"></td></tr>
+				<tr id="pwreset-deps-row" style="display:none"><th>{$depsLabel}</th><td id="pwreset-summary-deps"></td></tr>
 				<tr><th>{$dirsLabel}</th><td id="pwreset-summary-dirs"></td></tr>
 				<tr><th>{$chmodLabel}</th><td id="pwreset-summary-chmod"></td></tr>
 			</table>
 		</div>
 		<div class="uk-modal-footer uk-text-right">
-			<button type="button" class="uk-button uk-button-default uk-modal-close">{$cancelLabel}</button>
-			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-danger">
+			<button type="button" class="uk-button uk-button-muted uk-modal-close">{$cancelLabel}</button>
+			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-default">
 				<i class="fa fa-refresh"></i> {$btnLabel}
 			</button>
 		</div>
@@ -324,18 +327,16 @@ document.addEventListener('DOMContentLoaded', function() {
 	var noneText = '{$noneLabel}';
 	var confirmText = '{$confirmText}';
 	var confirmed = false;
+	var precomputedDeps = {$depsJson};
 
 	if (!checkbox || !confirmBtn || !modal) return;
 
-	// Intercept form submit: if checkbox is checked, show modal instead
 	var form = checkbox.closest('form');
 	if (!form) return;
 
 	form.addEventListener('submit', function(e) {
-		if (!checkbox.checked || confirmed) return; // normal save or already confirmed
+		if (!checkbox.checked || confirmed) return;
 		e.preventDefault();
-
-		// ── Populate summary from current form values ──
 
 		// Profile
 		var profileInput = form.querySelector('[name=profilePath]');
@@ -343,13 +344,12 @@ document.addEventListener('DOMContentLoaded', function() {
 		document.getElementById('pwreset-summary-profile').textContent =
 			profileVal ? profileVal : defaultProfile;
 
-		// Modules (read from AsmSelect rendered list)
+		// Modules (from AsmSelect)
 		var moduleItems = [];
 		var asmItems = form.querySelectorAll('#wrap_keepModules .asmListItem .asmListItemLabel');
 		if (asmItems.length) {
 			asmItems.forEach(function(el) { moduleItems.push(el.textContent.trim()); });
 		} else {
-			// Fallback: read from the select element
 			var moduleSelect = form.querySelector('[name="keepModules[]"]');
 			if (moduleSelect) {
 				for (var i = 0; i < moduleSelect.options.length; i++) {
@@ -367,12 +367,23 @@ document.addEventListener('DOMContentLoaded', function() {
 			modulesEl.textContent = noneText;
 		}
 
+		// Auto-included dependencies
+		var depsRow = document.getElementById('pwreset-deps-row');
+		var depsEl = document.getElementById('pwreset-summary-deps');
+		if (precomputedDeps.length > 0) {
+			depsRow.style.display = '';
+			depsEl.innerHTML = '<ul class="uk-list uk-list-bullet uk-margin-remove">' +
+				precomputedDeps.map(function(d) { return '<li>' + d + '</li>'; }).join('') + '</ul>';
+		} else {
+			depsRow.style.display = 'none';
+		}
+
 		// Directories
 		var dirsInput = form.querySelector('[name=keepDirectories]');
 		var dirsVal = dirsInput ? dirsInput.value.trim() : '';
 		var dirsEl = document.getElementById('pwreset-summary-dirs');
 		if (dirsVal) {
-			var dirLines = dirsVal.split('\\n').filter(function(l) {
+			var dirLines = dirsVal.split('\n').filter(function(l) {
 				return l.trim() && l.trim()[0] !== '#';
 			});
 			if (dirLines.length) {
@@ -385,18 +396,13 @@ document.addEventListener('DOMContentLoaded', function() {
 			dirsEl.textContent = noneText;
 		}
 
-		// Chmod
+		// Chmod — always show both values
 		var chmodDirInput = form.querySelector('[name=chmodDir]');
 		var chmodFileInput = form.querySelector('[name=chmodFile]');
-		var chmodDir = chmodDirInput ? chmodDirInput.value.trim() : '';
-		var chmodFile = chmodFileInput ? chmodFileInput.value.trim() : '';
-		var chmodParts = [];
-		if (chmodDir) chmodParts.push('Dirs: ' + chmodDir);
-		if (chmodFile) chmodParts.push('Files: ' + chmodFile);
+		var chmodDirVal = (chmodDirInput && chmodDirInput.value.trim()) || (chmodDirInput ? chmodDirInput.placeholder : '0755');
+		var chmodFileVal = (chmodFileInput && chmodFileInput.value.trim()) || (chmodFileInput ? chmodFileInput.placeholder : '0644');
 		document.getElementById('pwreset-summary-chmod').textContent =
-			chmodParts.length ? chmodParts.join(', ') :
-			(chmodDirInput ? chmodDirInput.placeholder : '0755') + ' / ' +
-			(chmodFileInput ? chmodFileInput.placeholder : '0644') + ' (defaults)';
+			'Dirs: ' + chmodDirVal + ', Files: ' + chmodFileVal;
 
 		UIkit.modal(modal).show();
 	});
@@ -413,7 +419,7 @@ document.addEventListener('DOMContentLoaded', function() {
 	});
 });
 </script>
-HTML;
+HTMLMODAL;
 	}
 
 	/**
