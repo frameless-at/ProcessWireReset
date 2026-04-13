@@ -1201,6 +1201,13 @@ HTMLMODAL;
 			} else {
 				$replace['(255)'] = '(250)';
 			}
+		} else {
+			// Profile may have been exported from a utf8mb4 database.
+			// Replace all utf8mb4 references (charset + collation) in
+			// CREATE TABLE statements so they match the target charset.
+			// e.g. "utf8mb4_general_ci" → "utf8_general_ci",
+			//      "CHARACTER SET utf8mb4" → "CHARACTER SET utf8"
+			$replace['utf8mb4'] = $dbCharset;
 		}
 
 		$restoreOptions['findReplaceCreateTable'] = $replace;
