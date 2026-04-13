@@ -1186,7 +1186,17 @@ HTMLMODAL;
 
 		$restoreOptions = [];
 		$dbEngine = $config->dbEngine ?: 'InnoDB';
+
+		// Detect the ACTUAL database charset rather than trusting
+		// $config->dbCharset — the config may say 'utf8mb4' while the
+		// database actually uses 'utf8'/'utf8mb3' (common on shared hosting).
 		$dbCharset = $config->dbCharset ?: 'utf8';
+		try {
+			$actualCharset = $database->query("SELECT @@character_set_database")->fetchColumn();
+			if ($actualCharset) $dbCharset = $actualCharset;
+		} catch (\PDOException $e) {
+			// Fall back to config value
+		}
 
 		$replace = [];
 		$replace['ENGINE=InnoDB'] = "ENGINE=$dbEngine";
