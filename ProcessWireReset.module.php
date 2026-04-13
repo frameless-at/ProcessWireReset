@@ -473,8 +473,8 @@ HTMLMODAL;
 		$f->attr('name', 'profilePath');
 		$f->attr('value', $data['profilePath']);
 		$f->label = $this->_('Custom Profile Path');
-		$f->description = $this->_('Path to a custom profile install directory containing install.sql. Leave empty to use the bundled default (site-blank). For templates, the module looks for a templates/ directory as a sibling of the install directory.');
-		$f->notes = $this->_('Example: /var/www/profiles/site-blank/install/');
+		$f->description = $this->_('Path to the install directory of a custom profile (must contain install.sql). Relative paths are resolved from the PW root. Leave empty to use the bundled default (site-blank). Templates are loaded from a sibling templates/ directory if present.');
+		$f->notes = $this->_('Example: site-rockfrontend/install/');
 		$f->collapsed = Inputfield::collapsedBlank;
 		$fs->add($f);
 
@@ -1421,7 +1421,8 @@ HTMLMODAL;
 	 */
 	protected function resolveProfileInstallSql(array $data) {
 		if (!empty($data['profilePath'])) {
-			$candidate = rtrim($data['profilePath'], '/') . '/install.sql';
+			$profilePath = $this->resolveProfilePath($data['profilePath']);
+			$candidate = rtrim($profilePath, '/') . '/install.sql';
 			$path = realpath($candidate);
 			if ($path === false) return null;
 			if (!$this->isPathAllowed($path)) return null;
@@ -1443,7 +1444,8 @@ HTMLMODAL;
 	 */
 	protected function resolveProfileTemplatesPath(array $data) {
 		if (!empty($data['profilePath'])) {
-			$candidate = dirname(rtrim($data['profilePath'], '/')) . '/templates/';
+			$profilePath = $this->resolveProfilePath($data['profilePath']);
+			$candidate = dirname(rtrim($profilePath, '/')) . '/templates/';
 			$path = realpath($candidate);
 			if ($path === false) return null;
 			if (!$this->isPathAllowed($path)) return null;
@@ -1451,6 +1453,24 @@ HTMLMODAL;
 		}
 		$path = __DIR__ . '/install/site-templates/';
 		return is_dir($path) ? $path : null;
+	}
+
+	/**
+	 * Resolve a profile path that may be relative or absolute
+	 *
+	 * Relative paths are resolved against the PW root directory, so
+	 * users can enter "site-rockfrontend/install/" instead of the full
+	 * absolute path.
+	 *
+	 * @param string $path User-supplied path
+	 * @return string Absolute path
+	 */
+	protected function resolveProfilePath($path) {
+		$path = trim($path);
+		// Already absolute
+		if ($path !== '' && $path[0] === '/') return $path;
+		// Relative — prepend PW root
+		return rtrim($this->wire('config')->paths->root, '/') . '/' . $path;
 	}
 
 	/**
