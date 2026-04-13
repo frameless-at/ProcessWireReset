@@ -1243,33 +1243,14 @@ HTMLMODAL;
 			$profileContent = str_replace('ENGINE=MyISAM', "ENGINE=$dbEngine", $profileContent);
 			$profileContent = str_replace('ENGINE=InnoDB', "ENGINE=$dbEngine", $profileContent);
 
-			// Fix charset/collation mismatches. Profiles exported from MariaDB
-			// have "CHARSET=utf8 COLLATE=utf8mb4_general_ci" which is valid
-			// on MariaDB (where utf8=utf8mb4) but INVALID on MySQL 8.0
-			// (where utf8=utf8mb3). Always normalize: replace utf8mb4
-			// collations with the target charset's collation, regardless of
-			// what the detection returned.
-			$lowerCharset = strtolower($dbCharset);
-
-			// ALWAYS fix the MariaDB utf8+utf8mb4 mismatch
-			// Replace "COLLATE=utf8mb4_" with "COLLATE={charset}_"
-			// and "COLLATE utf8mb4_" with "COLLATE {charset}_"
-			$profileContent = str_replace('utf8mb4_general_ci', $dbCharset . '_general_ci', $profileContent);
-			$profileContent = str_replace('utf8mb4_unicode_ci', $dbCharset . '_unicode_ci', $profileContent);
-			$profileContent = str_replace('utf8mb4_unicode_520_ci', $dbCharset . '_unicode_520_ci', $profileContent);
-			// Catch-all for any remaining utf8mb4 charset references
-			if ($lowerCharset !== 'utf8mb4') {
-				$profileContent = str_replace('CHARSET=utf8mb4', "CHARSET=$dbCharset", $profileContent);
-				$profileContent = str_replace('CHARACTER SET utf8mb4', "CHARACTER SET $dbCharset", $profileContent);
-			}
-
-			if ($lowerCharset === 'utf8mb4') {
-				// Key length adjustments for utf8mb4 + InnoDB
-				if (strtolower($dbEngine) === 'innodb') {
-					$profileContent = str_replace('(255)', '(191)', $profileContent);
-					$profileContent = str_replace('(250)', '(191)', $profileContent);
-				}
-			}
+			// Strip ALL explicit COLLATE specifications from the SQL.
+			// MySQL automatically selects the correct default collation for
+			// whatever charset a table uses. By removing COLLATE entirely,
+			// the SQL works on ANY MySQL/MariaDB version regardless of the
+			// charset — no fragile string-replacement heuristics needed.
+			// This is exactly how PW's own bundled install.sql works: no
+			// COLLATE anywhere.
+			$profileContent = preg_replace('/\s+COLLATE[=\s]+\S+/i', '', $profileContent);
 
 			// Write to a temp file in PW's assets dir (sys_get_temp_dir may not
 			// be writable on shared hosting)
