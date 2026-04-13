@@ -736,8 +736,14 @@ HTMLMODAL;
 		// in a transaction would be misleading. Instead, we use try/catch to
 		// surface errors clearly and clean up any partial state on failure.
 		try {
+			// Detect the ACTUAL charset from an existing PW table BEFORE
+			// dropping. Neither $config->dbCharset nor @@character_set_database
+			// are reliable — the config may say utf8mb4, the database default
+			// may be utf8mb4, but the actual tables use utf8mb3.
+			$tableCharset = $this->detectTableCharset($database, $config);
+
 			$this->dropAllTables($database);
-			$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config);
+			$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config, $tableCharset);
 			$this->restoreSuperuser($database, $superuser, $config);
 			// Only re-register ProcessWireReset itself directly so PW can autoload
 			// it on the next request. Other kept modules are deferred — their
@@ -1100,6 +1106,39 @@ HTMLMODAL;
 	 * @param WireDatabasePDO $database
 	 * @throws WireException If tables remain after all drop passes
 	 */
+	/**
+	 * Detect the actual charset used by existing PW tables
+	 *
+	 * Queries information_schema for the collation of the 'caches' table
+	 * (always exists in a PW install) and extracts the charset prefix.
+	 * This is the only reliable way to determine the target charset —
+	 * $config->dbCharset and @@character_set_database can both lie.
+	 *
+	 * @param WireDatabasePDO $database
+	 * @param Config $config
+	 * @return string Charset name (e.g. 'utf8mb3', 'utf8', 'utf8mb4')
+	 */
+	protected function detectTableCharset($database, $config) {
+		$dbName = $config->dbName;
+		try {
+			$stmt = $database->prepare(
+				"SELECT TABLE_COLLATION FROM information_schema.TABLES " .
+				"WHERE TABLE_SCHEMA = :db AND TABLE_NAME = 'caches' LIMIT 1"
+			);
+			$stmt->execute([':db' => $dbName]);
+			$collation = $stmt->fetchColumn();
+			if ($collation) {
+				// Extract charset from collation: utf8mb3_general_ci → utf8mb3
+				$parts = explode('_', $collation, 2);
+				return $parts[0];
+			}
+		} catch (\PDOException $e) {
+			// Fall through
+		}
+		// Fallback
+		return $config->dbCharset ?: 'utf8';
+	}
+
 	protected function dropAllTables($database) {
 		$dbName = $this->wire('config')->dbName;
 
@@ -1175,7 +1214,7 @@ HTMLMODAL;
 	 * @param Config $config
 	 * @throws WireException
 	 */
-	protected function importSqlMerged($database, $coreFile, $profileFile, $config) {
+	protected function importSqlMerged($database, $coreFile, $profileFile, $config, $tableCharset = null) {
 		$backupClass = $config->paths->wire . 'core/WireDatabaseBackup.php';
 		if (!class_exists('\ProcessWire\WireDatabaseBackup', false)) {
 			require_once $backupClass;
@@ -1186,16 +1225,9 @@ HTMLMODAL;
 
 		$dbEngine = $config->dbEngine ?: 'InnoDB';
 
-		// Detect the ACTUAL database charset rather than trusting
-		// $config->dbCharset — the config may say 'utf8mb4' while the
-		// database actually uses 'utf8'/'utf8mb3' (common on shared hosting).
-		$dbCharset = $config->dbCharset ?: 'utf8';
-		try {
-			$actualCharset = $database->query("SELECT @@character_set_database")->fetchColumn();
-			if ($actualCharset) $dbCharset = $actualCharset;
-		} catch (\PDOException $e) {
-			// Fall back to config value
-		}
+		// Use the charset detected from actual table collation (passed in
+		// from executeReset, queried BEFORE tables were dropped).
+		$dbCharset = $tableCharset ?: ($config->dbCharset ?: 'utf8');
 
 		// Pre-process the profile SQL file directly. We cannot rely on
 		// WireDatabaseBackup's findReplaceCreateTable option because it
