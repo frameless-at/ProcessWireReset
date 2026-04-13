@@ -8,6 +8,7 @@
  *  - ?mode=check          Show status of the database (default)
  *  - ?mode=fix            Fix missing field_permissions / field_roles data
  *  - ?mode=password       Set a new password for the superuser (use with &pass=NEW&user=USERNAME)
+ *  - ?mode=reimport       Drop all tables and reimport from core + bundled default install.sql
  *
  * Upload this file to your PW root directory and open it in the browser.
  * DELETE THIS FILE AFTER USE.
@@ -101,6 +102,97 @@ if ($mode === 'password') {
             }
         } catch (Exception $e) {
             $results[] = "ERROR: " . $e->getMessage();
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// MODE: reimport — drop all tables and reimport from install.sql
+// ════════════════════════════════════════════════════════════════════════
+if ($mode === 'reimport') {
+    // Locate SQL files
+    $wireRoot = __DIR__ . '/wire/';
+    $coreInstallSql = $wireRoot . 'core/install.sql';
+    $moduleInstallSql = __DIR__ . '/site/modules/ProcessWireReset/install/install.sql';
+
+    if (!is_file($coreInstallSql)) {
+        $results[] = "ERROR: Core install.sql not found at $coreInstallSql";
+    } elseif (!is_file($moduleInstallSql)) {
+        $results[] = "ERROR: Bundled install.sql not found at $moduleInstallSql";
+    } else {
+        try {
+            // Step 1: Drop all tables
+            $pdo->exec("SET FOREIGN_KEY_CHECKS = 0");
+            $tables = $pdo->query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '$dbName' AND TABLE_TYPE = 'BASE TABLE'")->fetchAll(PDO::FETCH_COLUMN);
+            foreach ($tables as $t) {
+                $safe = preg_replace('/[^a-zA-Z0-9_]/', '', $t);
+                if ($safe !== '') $pdo->exec("DROP TABLE IF EXISTS `$safe`");
+            }
+            $pdo->exec("SET FOREIGN_KEY_CHECKS = 1");
+            $results[] = "FIXED: Dropped " . count($tables) . " tables";
+
+            // Step 2: Import both SQL files via WireDatabaseBackup::restoreMerge
+            require_once $wireRoot . 'core/WireDatabaseBackup.php';
+            $backup = new ProcessWire\WireDatabaseBackup();
+            $backup->setDatabase($pdo);
+
+            $replace = [];
+            $replace['ENGINE=InnoDB'] = 'ENGINE=InnoDB';
+            $replace['ENGINE=MyISAM'] = 'ENGINE=InnoDB';
+            if (strtolower($dbCharset) !== 'utf8mb4') {
+                $replace['utf8mb4'] = $dbCharset;
+            }
+            $restoreOptions = ['findReplaceCreateTable' => $replace];
+
+            if ($backup->restoreMerge($coreInstallSql, $moduleInstallSql, $restoreOptions)) {
+                $results[] = "FIXED: Imported core + profile install.sql";
+            } else {
+                foreach ($backup->errors() as $err) {
+                    $results[] = "ERROR: $err";
+                }
+            }
+
+            // Step 3: Set password for admin user if provided
+            if (!empty($_GET['user']) && !empty($_GET['pass']) && !empty($userAuthSalt)) {
+                $userName = $_GET['user'];
+                $newPass = $_GET['pass'];
+
+                // Update admin page name
+                $pdo->prepare("UPDATE pages SET name = ? WHERE id = 41")->execute([$userName]);
+
+                // Hash password
+                $bcryptSalt = '$2y$11$' . substr(strtr(base64_encode(random_bytes(16)), '+', '.'), 0, 22);
+                $fullHash = crypt($newPass . $userAuthSalt, $bcryptSalt);
+                $passSalt = substr($fullHash, 0, 29);
+                $passData = substr($fullHash, 29);
+
+                $pdo->exec("ALTER TABLE field_pass MODIFY data VARCHAR(255) NOT NULL");
+                $pdo->exec("ALTER TABLE field_pass MODIFY salt VARCHAR(255) NOT NULL");
+                $pdo->prepare("DELETE FROM field_pass WHERE pages_id = 41")->execute();
+                $pdo->prepare("INSERT INTO field_pass (pages_id, data, salt) VALUES (41, ?, ?)")->execute([$passData, $passSalt]);
+
+                $results[] = "FIXED: Password set for user '$userName'";
+            } else {
+                $results[] = "WARNING: No user/pass provided — admin account has empty password. Use ?mode=password&user=NAME&pass=PASS after reimport.";
+            }
+
+            // Step 4: Re-register ProcessWireReset
+            try {
+                $pdo->exec("INSERT INTO modules (class, flags, data, created) VALUES ('ProcessWireReset', 0, '', NOW())");
+                $results[] = "FIXED: ProcessWireReset re-registered in modules table";
+            } catch (Exception $e) {
+                $results[] = "INFO: ProcessWireReset already in modules table";
+            }
+
+            // Step 5: Ensure installed.php exists
+            $installedFile = __DIR__ . '/site/assets/installed.php';
+            if (!file_exists($installedFile)) {
+                file_put_contents($installedFile, "<?php // Prevents installer from running.");
+                $results[] = "FIXED: Created site/assets/installed.php";
+            }
+
+        } catch (Exception $e) {
+            $results[] = "ERROR: Reimport failed: " . $e->getMessage();
         }
     }
 }
@@ -200,6 +292,7 @@ foreach ($results as $result) {
 echo "<hr><h3>Available actions:</h3>";
 echo "<p><a href='?mode=check'>Check status</a></p>";
 echo "<p><a href='?mode=fix'>Fix missing permissions/roles data</a></p>";
+echo "<p>Full reimport (drop all + import default): <code>?mode=reimport&user=YOUR_USERNAME&pass=NEW_PASSWORD</code></p>";
 echo "<p>Set new password: <code>?mode=password&user=YOUR_USERNAME&pass=NEW_PASSWORD</code></p>";
 echo "<p><strong>DELETE THIS FILE NOW:</strong> <code>rm " . htmlspecialchars(__FILE__) . "</code></p>";
 echo "</body></html>";
