@@ -472,9 +472,9 @@ HTMLMODAL;
 		$f = $modules->get('InputfieldText');
 		$f->attr('name', 'profilePath');
 		$f->attr('value', $data['profilePath']);
-		$f->label = $this->_('Custom Profile Path');
-		$f->description = $this->_('Path to the install directory of a custom profile (must contain install.sql). Relative paths are resolved from the PW root. Leave empty to use the bundled default (site-blank). Templates are loaded from a sibling templates/ directory if present.');
-		$f->notes = $this->_('Example: site-rockfrontend/install/');
+		$f->label = $this->_('Custom Profile');
+		$f->description = $this->_('Path to a profile directory (containing install/ and templates/ subdirectories). Relative paths are resolved from the PW root. Leave empty to use the bundled default (site-blank).');
+		$f->notes = $this->_('Example: site-rockfrontend');
 		$f->collapsed = Inputfield::collapsedBlank;
 		$fs->add($f);
 
@@ -1422,7 +1422,7 @@ HTMLMODAL;
 	protected function resolveProfileInstallSql(array $data) {
 		if (!empty($data['profilePath'])) {
 			$profilePath = $this->resolveProfilePath($data['profilePath']);
-			$candidate = rtrim($profilePath, '/') . '/install.sql';
+			$candidate = rtrim($profilePath, '/') . '/install/install.sql';
 			$path = realpath($candidate);
 			if ($path === false) return null;
 			if (!$this->isPathAllowed($path)) return null;
@@ -1435,9 +1435,9 @@ HTMLMODAL;
 	 * Resolve the path to the profile's template files
 	 *
 	 * For the bundled default, templates live in install/site-templates/.
-	 * For custom profiles, templates are expected at ../templates/ relative
-	 * to the install dir. Custom paths are validated against the PW root
-	 * to prevent directory traversal.
+	 * For custom profiles, templates are at <profilePath>/templates/.
+	 * Custom paths are validated against the PW root to prevent directory
+	 * traversal.
 	 *
 	 * @param array $data Module config data
 	 * @return string|null Absolute path to templates dir or null if invalid
@@ -1445,7 +1445,7 @@ HTMLMODAL;
 	protected function resolveProfileTemplatesPath(array $data) {
 		if (!empty($data['profilePath'])) {
 			$profilePath = $this->resolveProfilePath($data['profilePath']);
-			$candidate = dirname(rtrim($profilePath, '/')) . '/templates/';
+			$candidate = rtrim($profilePath, '/') . '/templates/';
 			$path = realpath($candidate);
 			if ($path === false) return null;
 			if (!$this->isPathAllowed($path)) return null;
