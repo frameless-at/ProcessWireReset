@@ -1250,7 +1250,7 @@ HTMLMODAL;
 			// charset — no fragile string-replacement heuristics needed.
 			// This is exactly how PW's own bundled install.sql works: no
 			// COLLATE anywhere.
-			$profileContent = preg_replace('/\s+COLLATE[=\s]+\S+/i', '', $profileContent);
+			$profileContent = preg_replace('/\s+COLLATE[=\s]+[a-zA-Z0-9_]+/i', '', $profileContent);
 
 			// Write to a temp file in PW's assets dir (sys_get_temp_dir may not
 			// be writable on shared hosting)
