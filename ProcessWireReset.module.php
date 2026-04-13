@@ -1203,6 +1203,7 @@ HTMLMODAL;
 		// (tested: still fails on shared hosting with utf8mb3 databases).
 		// Instead, we read the profile SQL, do all replacements ourselves,
 		// write to a temp file, and pass that to restoreMerge.
+		$tempDir = $config->paths->assets;
 		$tempProfileFile = null;
 		$profileContent = file_get_contents($profileFile);
 		if ($profileContent !== false) {
@@ -1222,8 +1223,13 @@ HTMLMODAL;
 				}
 			}
 
-			$tempProfileFile = tempnam(sys_get_temp_dir(), 'pwreset_profile_');
-			file_put_contents($tempProfileFile, $profileContent);
+			// Write to a temp file in PW's assets dir (sys_get_temp_dir may not
+			// be writable on shared hosting)
+			$tempDir = $config->paths->assets;
+			$tempProfileFile = $tempDir . '.pwreset_profile_' . uniqid() . '.sql';
+			if (file_put_contents($tempProfileFile, $profileContent) === false) {
+				throw new WireException("Cannot write temp profile SQL to $tempProfileFile");
+			}
 		}
 
 		$actualProfileFile = $tempProfileFile ?: $profileFile;
@@ -1233,8 +1239,10 @@ HTMLMODAL;
 		$coreContent = file_get_contents($coreFile);
 		if ($coreContent !== false) {
 			$coreContent = str_replace('ENGINE=MyISAM', "ENGINE=$dbEngine", $coreContent);
-			$tempCoreFile = tempnam(sys_get_temp_dir(), 'pwreset_core_');
-			file_put_contents($tempCoreFile, $coreContent);
+			$tempCoreFile = $tempDir . '.pwreset_core_' . uniqid() . '.sql';
+			if (file_put_contents($tempCoreFile, $coreContent) === false) {
+				throw new WireException("Cannot write temp core SQL to $tempCoreFile");
+			}
 		}
 
 		$actualCoreFile = $tempCoreFile ?: $coreFile;
