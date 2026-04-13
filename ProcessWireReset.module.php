@@ -1184,7 +1184,6 @@ HTMLMODAL;
 		$backup = new WireDatabaseBackup();
 		$backup->setDatabase($database);
 
-		$restoreOptions = [];
 		$dbEngine = $config->dbEngine ?: 'InnoDB';
 
 		// Detect the ACTUAL database charset rather than trusting
@@ -1198,33 +1197,57 @@ HTMLMODAL;
 			// Fall back to config value
 		}
 
-		$replace = [];
-		$replace['ENGINE=InnoDB'] = "ENGINE=$dbEngine";
-		$replace['ENGINE=MyISAM'] = "ENGINE=$dbEngine";
-		$replace['CHARSET=utf8mb4;'] = "CHARSET=$dbCharset;";
-		$replace['CHARSET=utf8;'] = "CHARSET=$dbCharset;";
+		// Pre-process the profile SQL file directly. We cannot rely on
+		// WireDatabaseBackup's findReplaceCreateTable option because it
+		// does not reliably handle all charset/collation references
+		// (tested: still fails on shared hosting with utf8mb3 databases).
+		// Instead, we read the profile SQL, do all replacements ourselves,
+		// write to a temp file, and pass that to restoreMerge.
+		$tempProfileFile = null;
+		$profileContent = file_get_contents($profileFile);
+		if ($profileContent !== false) {
+			// Engine replacements
+			$profileContent = str_replace('ENGINE=MyISAM', "ENGINE=$dbEngine", $profileContent);
+			$profileContent = str_replace('ENGINE=InnoDB', "ENGINE=$dbEngine", $profileContent);
 
-		if (strtolower($dbCharset) === 'utf8mb4') {
-			if (strtolower($dbEngine) === 'innodb') {
-				$replace['(255)'] = '(191)';
-				$replace['(250)'] = '(191)';
-			} else {
-				$replace['(255)'] = '(250)';
+			// Charset/collation replacements
+			if (strtolower($dbCharset) !== 'utf8mb4') {
+				$profileContent = str_replace('utf8mb4', $dbCharset, $profileContent);
 			}
-		} else {
-			// Profile may have been exported from a utf8mb4 database.
-			// Replace all utf8mb4 references (charset + collation) in
-			// CREATE TABLE statements so they match the target charset.
-			// e.g. "utf8mb4_general_ci" → "utf8_general_ci",
-			//      "CHARACTER SET utf8mb4" → "CHARACTER SET utf8"
-			$replace['utf8mb4'] = $dbCharset;
+			if (strtolower($dbCharset) === 'utf8mb4') {
+				// Key length adjustments for utf8mb4 + InnoDB
+				if (strtolower($dbEngine) === 'innodb') {
+					$profileContent = str_replace('(255)', '(191)', $profileContent);
+					$profileContent = str_replace('(250)', '(191)', $profileContent);
+				}
+			}
+
+			$tempProfileFile = tempnam(sys_get_temp_dir(), 'pwreset_profile_');
+			file_put_contents($tempProfileFile, $profileContent);
 		}
 
-		$restoreOptions['findReplaceCreateTable'] = $replace;
+		$actualProfileFile = $tempProfileFile ?: $profileFile;
 
-		if (!$backup->restoreMerge($coreFile, $profileFile, $restoreOptions)) {
-			$errors = $backup->errors();
-			throw new WireException("SQL import failed: " . implode(', ', $errors));
+		// Also apply engine replacement to the core file
+		$tempCoreFile = null;
+		$coreContent = file_get_contents($coreFile);
+		if ($coreContent !== false) {
+			$coreContent = str_replace('ENGINE=MyISAM', "ENGINE=$dbEngine", $coreContent);
+			$tempCoreFile = tempnam(sys_get_temp_dir(), 'pwreset_core_');
+			file_put_contents($tempCoreFile, $coreContent);
+		}
+
+		$actualCoreFile = $tempCoreFile ?: $coreFile;
+
+		try {
+			if (!$backup->restoreMerge($actualCoreFile, $actualProfileFile, [])) {
+				$errors = $backup->errors();
+				throw new WireException("SQL import failed: " . implode(', ', $errors));
+			}
+		} finally {
+			// Clean up temp files
+			if ($tempProfileFile && file_exists($tempProfileFile)) unlink($tempProfileFile);
+			if ($tempCoreFile && file_exists($tempCoreFile)) unlink($tempCoreFile);
 		}
 	}
 
