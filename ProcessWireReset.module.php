@@ -811,85 +811,80 @@ HTMLMODAL;
 				$database->exec($superuser['email_schema']);
 			}
 
-			// Invalidate PW's in-memory caches before the API-level save.
-			// The DB is now freshly imported, but $modules / $pages / $users
-			// still hold instances reflecting the PRE-reset state. PW's own
-			// installer bootstraps a new ProcessWire after the DB import and
-			// thereby gets a clean slate; we're running inside a live request,
-			// so we have to refresh explicitly. Mirrors the installer's own
-			// execute() step 5, which calls $wire->modules->refresh() before
-			// adminAccountSave().
-			$this->wire('modules')->refresh();
-			$this->wire('pages')->uncacheAll();
-
-			// Step 2: admin account — run the EXACT installer adminAccountSave().
-			// The installer reads values from $wire->input->post(). PW's
-			// WireInputData caches $_POST at boot time, so setting $_POST now
-			// would be too late — we must use $wire->input->post->set() to
-			// write directly into WireInputData's internal data array.
+			// Step 2: restore superuser account via direct DB operations.
 			//
-			// Email: pass empty string so the installer's $sanitizer->email()
-			// check always passes (it rejects non-RFC addresses like
-			// user@localhost). The real email is restored via direct DB UPDATE
-			// after adminAccountSave() returns.
-			$placeholderPass = bin2hex(random_bytes(8)) . 'Aa1!';
-			$inputPost = $this->wire('input')->post;
-			$inputPost->set('username', $superuser['name']);
-			$inputPost->set('userpass', $placeholderPass);
-			$inputPost->set('userpass_confirm', $placeholderPass);
-			$inputPost->set('useremail', '');
-			$inputPost->set('admin_name', $superuser['admin_name'] ?: 'processwire');
+			// We do NOT use the installer's adminAccountSave() here. That method
+			// was designed for a fresh ProcessWire bootstrap — a new $wire
+			// instance with empty caches. Inside a live request the in-memory
+			// caches for Users, Pages, Modules are stale relative to the just-
+			// imported DB, and the API-level save triggers hooks and field
+			// handlers that interact with those stale caches in unpredictable
+			// ways (empty email, admin_theme not persisted, etc.).
+			//
+			// Instead we mirror exactly what adminAccountSave() writes to the
+			// DB, but do it directly — no API, no cache, no surprises.
 
-			ob_start();
-			$installer->adminAccountSave($this->wire());
-			ob_end_clean();
+			// 2a. Superuser page name
+			$stmt = $database->prepare("UPDATE pages SET name = :name WHERE id = :id");
+			$stmt->execute([':name' => $superuser['name'], ':id' => (int) $superuser['id']]);
 
-			if($installer->numErrors) {
-				throw new WireException(
-					'adminAccountSave failed: ' . implode('; ', $installer->errors)
-				);
-			}
+			// 2b. Admin root page name (preserves custom admin URL slug)
+			$stmt = $database->prepare("UPDATE pages SET name = :name WHERE id = :id");
+			$stmt->execute([
+				':name' => $superuser['admin_name'] ?: 'processwire',
+				':id' => (int) $config->adminRootPageID,
+			]);
 
-			// Overwrite field_pass with the original hash+salt so the existing
-			// login keeps working. adminAccountSave above stored a placeholder
-			// bcrypt hash; we replace it here with the backed-up credentials.
+			// 2c. Password — install.sql seeds an empty row for pages_id=41;
+			//     UPDATE it with the backed-up hash+salt.
 			if(!empty($superuser['pass_data'])) {
 				$stmt = $database->prepare(
-					'UPDATE field_pass SET data = :data, salt = :salt WHERE pages_id = :id'
+					"INSERT INTO field_pass (pages_id, data, salt)
+					 VALUES (:id, :data, :salt)
+					 ON DUPLICATE KEY UPDATE data = VALUES(data), salt = VALUES(salt)"
 				);
 				$stmt->execute([
+					':id' => (int) $superuser['id'],
 					':data' => $superuser['pass_data'],
 					':salt' => $superuser['pass_salt'],
-					':id' => (int) $superuser['id'],
 				]);
 			}
 
-			// Preserve original email verbatim (sanitizer may reject non-standard
-			// addresses; we always want to restore exactly what was in the DB).
+			// 2d. Email — install.sql may not seed a row for the superuser;
+			//     use UPSERT so it works whether the row exists or not.
 			if(!empty($superuser['email'])) {
 				$stmt = $database->prepare(
-					'UPDATE field_email SET data = :data WHERE pages_id = :id'
+					"INSERT INTO field_email (pages_id, data)
+					 VALUES (:id, :data)
+					 ON DUPLICATE KEY UPDATE data = VALUES(data)"
 				);
 				$stmt->execute([
-					':data' => $superuser['email'],
 					':id' => (int) $superuser['id'],
+					':data' => $superuser['email'],
 				]);
 			}
 
-			// Restore useAsLogin for AdminThemeUikit.
-			// AdminThemeFramework initialises useAsLogin to false. The value
-			// normally comes from the profile's install.sql (a pre-seeded
-			// modules row with data='{"useAsLogin":1}'). Our $modules->refresh()
-			// call above re-scans the filesystem and can overwrite that row with
-			// fresh default data, losing the flag. Re-apply it explicitly —
-			// the same end-state as a fresh PW install via the wizard.
-			if($this->wire('modules')->isInstalled('AdminThemeUikit')) {
-				$atCfg = $this->wire('modules')->getConfig('AdminThemeUikit');
-				if(empty($atCfg['useAsLogin'])) {
-					$atCfg['useAsLogin'] = 1;
-					$this->wire('modules')->saveConfig('AdminThemeUikit', $atCfg);
-				}
-			}
+			// 2e. Admin theme preference — restore the backed-up value.
+			//     fall back to 'AdminThemeUikit' (standard PW default).
+			$adminThemeVal = !empty($superuser['admin_theme'])
+				? $superuser['admin_theme']
+				: 'AdminThemeUikit';
+			$stmt = $database->prepare(
+				"INSERT INTO field_admin_theme (pages_id, data)
+				 VALUES (:id, :data)
+				 ON DUPLICATE KEY UPDATE data = VALUES(data)"
+			);
+			$stmt->execute([':id' => (int) $superuser['id'], ':data' => $adminThemeVal]);
+
+			// 2f. useAsLogin for AdminThemeUikit — set directly in the modules
+			//     table data column. Bypasses $modules->saveConfig() which is
+			//     unreliable after a DB reset (stale module cache can overwrite
+			//     the value). JSON_SET keeps any other stored config intact.
+			$database->exec(
+				"UPDATE modules
+				 SET data = JSON_SET(COALESCE(NULLIF(data,''), '{}'), '$.useAsLogin', 1)
+				 WHERE class = 'AdminThemeUikit'"
+			);
 
 			// Only re-register ProcessWireReset itself directly so PW can autoload
 			// it on the next request. Other kept modules are deferred — their
@@ -1039,6 +1034,17 @@ HTMLMODAL;
 			$passSchema = $this->getCreateTable($database, 'field_pass');
 			$emailSchema = $this->getCreateTable($database, 'field_email');
 
+			// Admin theme preference (stored in field_admin_theme per user)
+			$adminTheme = '';
+			try {
+				$stmt = $database->prepare("SELECT data FROM field_admin_theme WHERE pages_id = :id");
+				$stmt->execute([':id' => $userId]);
+				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
+				$adminTheme = $row ? $row['data'] : '';
+			} catch (\PDOException $e) {
+				// field_admin_theme may not exist yet — silently ignore
+			}
+
 			return [
 				'id' => $userId,
 				'name' => $page['name'],
@@ -1046,6 +1052,7 @@ HTMLMODAL;
 				'pass_data' => $pass ? rtrim($pass['data']) : '',
 				'pass_salt' => $pass ? rtrim($pass['salt']) : '',
 				'email' => $email ? $email['data'] : '',
+				'admin_theme' => $adminTheme,
 				'pass_schema' => $passSchema,
 				'email_schema' => $emailSchema,
 			];
