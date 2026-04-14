@@ -1,10 +1,20 @@
 <?php namespace ProcessWire;
 
+require_once __DIR__ . '/InstallerCore.php';
+
 /**
  * ProcessWire Reset Module
  *
  * Resets a ProcessWire installation to a clean profile state.
  * Preserves the current superuser account and selected site modules.
+ *
+ * The reset uses ProcessWire's own installer code (adapted in InstallerCore.php
+ * from the upstream install.php) to import the SQL and recreate the admin
+ * account — the installer's wizard GUI is skipped, and its variables are
+ * populated from the current installation's state (superuser credentials
+ * from the DB, profile path + kept modules from the module config). The
+ * result is equivalent to a fresh install, with the existing superuser
+ * login preserved.
  *
  * @property string $profilePath Custom path to profile install directory (containing install.sql)
  * @property array $keepModules Module class names to preserve during reset
@@ -729,7 +739,18 @@ HTMLMODAL;
 			$customTables = $this->backupCustomTables($database, $canonicalTables);
 		}
 
-		// ── Phase 2: Database reset ──────────────────────────────────────
+		// ── Phase 2: Database reset via PW installer code ─────────────────
+		//
+		// Uses InstallerCore — a headless adaptation of ProcessWire's own
+		// install.php — to import the SQL and create the admin account. The
+		// installer's wizard UI is gone; its "form variables" come from the
+		// current installation's state instead:
+		//
+		//   profileImportSQL()   ← core + profile install.sql
+		//   adminAccountSave()   ← username/email/admin_name from the backed-up
+		//                          superuser; password hash+salt are restored
+		//                          via $passOverride so the existing login keeps
+		//                          working (we don't have plain-text pass).
 		//
 		// Note: MySQL/MariaDB DDL statements (DROP TABLE, CREATE TABLE) cause
 		// implicit commits and cannot be rolled back, so wrapping this phase
@@ -742,9 +763,88 @@ HTMLMODAL;
 			// may be utf8mb4, but the actual tables use utf8mb3.
 			$tableCharset = $this->detectTableCharset($database, $config);
 
+			// Drop every existing table — profileImportSQL's CREATE statements
+			// only handle the canonical tables from install.sql; custom tables
+			// from modules would otherwise survive and collide with fresh
+			// module installs on the next request.
 			$this->dropAllTables($database);
-			$this->importSqlMerged($database, $coreInstallSql, $profileInstallSql, $config, $tableCharset);
-			$this->restoreSuperuser($database, $superuser, $config);
+
+			// Instantiate the headless installer and populate its "form vars"
+			// from the current installation's state. chmod values are kept as
+			// the octal-digit strings the PW installer expects (it calls
+			// octdec() internally); leading zeros are stripped so empty config
+			// falls back to the PW config defaults.
+			$chmodDirStr = (string) ($data['chmodDir'] ?: $config->chmodDir ?: '0755');
+			$chmodFileStr = (string) ($data['chmodFile'] ?: $config->chmodFile ?: '0644');
+			$installer = new InstallerCore();
+			$installer->chmodDir = ltrim($chmodDirStr, '0') ?: '755';
+			$installer->chmodFile = ltrim($chmodFileStr, '0') ?: '644';
+			$installer->dbEngine = $config->dbEngine ?: 'InnoDB';
+			$installer->dbCharset = $tableCharset;
+
+			// Step 1: import SQL (same as PW installer's profileImport step).
+			$installer->profileImportSQL(
+				$database,
+				$coreInstallSql,
+				$profileInstallSql,
+				[
+					'dbEngine' => $installer->dbEngine,
+					'dbCharset' => $installer->dbCharset,
+				]
+			);
+
+			// Preserve the original field_pass / field_email column sizes.
+			// SystemUpdater and third-party modules sometimes widen these
+			// columns over time (e.g. to hold longer Argon2/bcrypt hashes);
+			// re-importing install.sql resets them to the bundled defaults.
+			// Drop + recreate with the captured schemas so the upcoming
+			// password-hash restore won't truncate.
+			if (!empty($superuser['pass_schema'])) {
+				$database->exec("DROP TABLE IF EXISTS `field_pass`");
+				$database->exec($superuser['pass_schema']);
+				// Guest user (pages_id=40) row that core install.sql seeded —
+				// re-insert so PW's login logic doesn't choke on missing row.
+				$database->exec("INSERT INTO field_pass (pages_id, data, salt) VALUES (40, '', '')");
+			}
+			if (!empty($superuser['email_schema'])) {
+				$database->exec("DROP TABLE IF EXISTS `field_email`");
+				$database->exec($superuser['email_schema']);
+			}
+
+			// Invalidate PW's in-memory caches before the API-level save.
+			// The DB is now freshly imported, but $modules / $pages / $users
+			// still hold instances reflecting the PRE-reset state. PW's own
+			// installer bootstraps a new ProcessWire after the DB import and
+			// thereby gets a clean slate; we're running inside a live request,
+			// so we have to refresh explicitly. Mirrors the installer's own
+			// execute() step 5, which calls $wire->modules->refresh() before
+			// adminAccountSave().
+			$this->wire('modules')->refresh();
+			$this->wire('pages')->uncacheAll();
+
+			// Step 2: admin account (same as PW installer's adminAccountSave
+			// step) — creates the user through PW's API, then overwrites the
+			// password hash + email with the backed-up values so the existing
+			// login keeps working.
+			$placeholderPass = bin2hex(random_bytes(8)) . 'Aa1!';
+			$installer->adminAccountSave(
+				$this->wire(),
+				[
+					'username' => $superuser['name'],
+					'userpass' => $placeholderPass,
+					'useremail' => $superuser['email'] ?: '',
+					'admin_name' => $superuser['admin_name'] ?: 'processwire',
+					// Write raw email regardless of $sanitizer->email outcome —
+					// preserves whatever was stored before, even if it looks
+					// non-standard (e.g. internal addresses without a TLD).
+					'email_override' => $superuser['email'] ?: '',
+				],
+				[
+					'data' => $superuser['pass_data'],
+					'salt' => $superuser['pass_salt'],
+				]
+			);
+
 			// Only re-register ProcessWireReset itself directly so PW can autoload
 			// it on the next request. Other kept modules are deferred — their
 			// install() is called in processPendingInstalls() on the next request,
@@ -864,12 +964,20 @@ HTMLMODAL;
 	 */
 	protected function backupSuperuser($database, $config) {
 		$userId = (int) $config->superUserPageID;
+		$adminId = (int) $config->adminRootPageID;
 
 		try {
 			$stmt = $database->prepare("SELECT id, name FROM pages WHERE id = :id");
 			$stmt->execute([':id' => $userId]);
 			$page = $stmt->fetch(\PDO::FETCH_ASSOC);
 			if (!$page) return null;
+
+			// Admin root page name (the URL slug — e.g. "processwire", "admin").
+			// Preserved across the reset so bookmarked admin URLs keep working.
+			$stmt = $database->prepare("SELECT name FROM pages WHERE id = :id");
+			$stmt->execute([':id' => $adminId]);
+			$adminRow = $stmt->fetch(\PDO::FETCH_ASSOC);
+			$adminName = $adminRow ? $adminRow['name'] : 'processwire';
 
 			$stmt = $database->prepare("SELECT data, salt FROM field_pass WHERE pages_id = :id");
 			$stmt->execute([':id' => $userId]);
@@ -888,6 +996,7 @@ HTMLMODAL;
 			return [
 				'id' => $userId,
 				'name' => $page['name'],
+				'admin_name' => $adminName,
 				'pass_data' => $pass ? rtrim($pass['data']) : '',
 				'pass_salt' => $pass ? rtrim($pass['salt']) : '',
 				'email' => $email ? $email['data'] : '',
@@ -1195,153 +1304,6 @@ HTMLMODAL;
 				"dropAllTables: $remaining table(s) could not be dropped from database '$dbName'"
 			);
 		}
-	}
-
-	/**
-	 * Import a SQL file (PW install.sql format) via raw PDO
-	 *
-	 * Handles WireDatabaseBackup header lines and SQL comments.
-	 *
-	 * Uses WireDatabaseBackup::restoreMerge() — the same method the PW installer
-	 * uses. This correctly merges data from both files: core provides base data
-	 * (permissions, roles, passwords) while the profile adds content data.
-	 * Sequential import would fail because the profile's DROP TABLE statements
-	 * destroy the core's data.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @param string $coreFile Path to wire/core/install.sql
-	 * @param string $profileFile Path to profile install.sql
-	 * @param Config $config
-	 * @throws WireException
-	 */
-	protected function importSqlMerged($database, $coreFile, $profileFile, $config, $tableCharset = null) {
-		$backupClass = $config->paths->wire . 'core/WireDatabaseBackup.php';
-		if (!class_exists('\ProcessWire\WireDatabaseBackup', false)) {
-			require_once $backupClass;
-		}
-
-		$backup = new WireDatabaseBackup();
-		$backup->setDatabase($database);
-
-		$dbEngine = $config->dbEngine ?: 'InnoDB';
-
-		// Use the charset detected from actual table collation (passed in
-		// from executeReset, queried BEFORE tables were dropped).
-		$dbCharset = $tableCharset ?: ($config->dbCharset ?: 'utf8');
-
-		// Pre-process the profile SQL file directly. We cannot rely on
-		// WireDatabaseBackup's findReplaceCreateTable option because it
-		// does not reliably handle all charset/collation references
-		// (tested: still fails on shared hosting with utf8mb3 databases).
-		// Instead, we read the profile SQL, do all replacements ourselves,
-		// write to a temp file, and pass that to restoreMerge.
-		$tempDir = $config->paths->assets;
-		$tempProfileFile = null;
-		$profileContent = file_get_contents($profileFile);
-		if ($profileContent !== false) {
-			// Engine replacements
-			$profileContent = str_replace('ENGINE=MyISAM', "ENGINE=$dbEngine", $profileContent);
-			$profileContent = str_replace('ENGINE=InnoDB', "ENGINE=$dbEngine", $profileContent);
-
-			// Strip ALL explicit COLLATE specifications from the SQL.
-			// MySQL automatically selects the correct default collation for
-			// whatever charset a table uses. By removing COLLATE entirely,
-			// the SQL works on ANY MySQL/MariaDB version regardless of the
-			// charset — no fragile string-replacement heuristics needed.
-			// This is exactly how PW's own bundled install.sql works: no
-			// COLLATE anywhere.
-			$profileContent = preg_replace('/\s+COLLATE[=\s]+[a-zA-Z0-9_]+/i', '', $profileContent);
-
-			// Write to a temp file in PW's assets dir (sys_get_temp_dir may not
-			// be writable on shared hosting)
-			$tempDir = $config->paths->assets;
-			$tempProfileFile = $tempDir . '.pwreset_profile_' . uniqid() . '.sql';
-			if (file_put_contents($tempProfileFile, $profileContent) === false) {
-				throw new WireException("Cannot write temp profile SQL to $tempProfileFile");
-			}
-		}
-
-		$actualProfileFile = $tempProfileFile ?: $profileFile;
-
-		// Also apply engine replacement to the core file
-		$tempCoreFile = null;
-		$coreContent = file_get_contents($coreFile);
-		if ($coreContent !== false) {
-			$coreContent = str_replace('ENGINE=MyISAM', "ENGINE=$dbEngine", $coreContent);
-			$tempCoreFile = $tempDir . '.pwreset_core_' . uniqid() . '.sql';
-			if (file_put_contents($tempCoreFile, $coreContent) === false) {
-				throw new WireException("Cannot write temp core SQL to $tempCoreFile");
-			}
-		}
-
-		$actualCoreFile = $tempCoreFile ?: $coreFile;
-
-		try {
-			if (!$backup->restoreMerge($actualCoreFile, $actualProfileFile, [])) {
-				$errors = $backup->errors();
-				throw new WireException("SQL import failed: " . implode(', ', $errors));
-			}
-		} finally {
-			// Clean up temp files
-			if ($tempProfileFile && file_exists($tempProfileFile)) unlink($tempProfileFile);
-			if ($tempCoreFile && file_exists($tempCoreFile)) unlink($tempCoreFile);
-		}
-	}
-
-	/**
-	 * Restore the superuser account into the freshly imported database
-	 *
-	 * The core install.sql (imported via restoreMerge) already populates
-	 * field_pass, field_email, field_roles, and field_permissions with
-	 * empty defaults for users 40 and 41. We only need to UPDATE the
-	 * existing entries with the backed-up credentials.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @param array $superuser Backed-up superuser data
-	 * @param Config $config
-	 */
-	protected function restoreSuperuser($database, array $superuser, $config) {
-		$id = (int) $superuser['id'];
-
-		// Restore original field_pass/field_email schemas to prevent hash
-		// truncation if the live installation had larger columns than the
-		// default char(40)/char(32) (e.g. from PW upgrades over time).
-		// We drop the freshly imported tables and recreate with the original
-		// schemas, then re-insert the guest user defaults the core sql expects.
-		if (!empty($superuser['pass_schema'])) {
-			$database->exec("DROP TABLE IF EXISTS `field_pass`");
-			$database->exec($superuser['pass_schema']);
-			// Re-insert guest user default (core install.sql had this)
-			$database->exec("INSERT INTO field_pass (pages_id, data, salt) VALUES (40, '', '')");
-		}
-		if (!empty($superuser['email_schema'])) {
-			$database->exec("DROP TABLE IF EXISTS `field_email`");
-			$database->exec($superuser['email_schema']);
-		}
-
-		// Update admin page name to match original superuser
-		$stmt = $database->prepare("UPDATE pages SET name = :name WHERE id = :id");
-		$stmt->execute([':name' => $superuser['name'], ':id' => $id]);
-
-		// Insert password (table was just recreated, empty for user 41)
-		$stmt = $database->prepare(
-			"INSERT INTO field_pass (pages_id, data, salt) VALUES (:id, :data, :salt)"
-		);
-		$stmt->execute([
-			':id' => $id,
-			':data' => $superuser['pass_data'],
-			':salt' => $superuser['pass_salt'],
-		]);
-
-		// Insert email (table was just recreated)
-		$stmt = $database->prepare(
-			"INSERT INTO field_email (pages_id, data) VALUES (:id, :data)"
-		);
-		$stmt->execute([':id' => $id, ':data' => $superuser['email'] ?: '']);
-
-		// Roles and permissions are already set up by the core install.sql:
-		//   field_roles: user 41 gets guest + superuser roles
-		//   field_permissions: full default assignments for both roles
 	}
 
 	/**
