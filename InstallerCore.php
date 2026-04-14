@@ -82,6 +82,18 @@ class InstallerCore extends Installer {
 	public function sectionStop() {}
 	public function clear() {}
 
+	// ── Public wrappers for protected parent methods ─────────────────────
+	// The upstream Installer declares these as protected (wizard-only access).
+	// We widen visibility to public so executeReset() can call them directly.
+
+	/**
+	 * Run the exact parent adminAccountSave — public wrapper only.
+	 * See vendor/Installer.php for the real implementation.
+	 */
+	public function adminAccountSave($wire) {
+		parent::adminAccountSave($wire);
+	}
+
 	// ── Reset-specific overrides ──────────────────────────────────────────
 
 	/**
@@ -92,7 +104,7 @@ class InstallerCore extends Installer {
 	 * files must be kept: they're the profile that the reset just consumed
 	 * and may be used again for subsequent resets.
 	 */
-	protected function getRemoveableItems($getMarkup = false, $removeNow = false) {
+	public function getRemoveableItems($getMarkup = false, $removeNow = false) {
 		return $getMarkup ? '' : [];
 	}
 
@@ -103,7 +115,7 @@ class InstallerCore extends Installer {
 	 * when the file is loaded from there. We use $config->paths->root instead
 	 * so site/install/finish.php (e.g. from site-default) is found correctly.
 	 */
-	protected function finish($wire, $user) {
+	public function finish($wire, $user) {
 		$file = $wire->wire('config')->paths->root . 'site/install/finish.php';
 		if(is_file($file)) {
 			$fuel = array_merge($wire->wire('all')->getArray(), ['user' => $user]);
@@ -123,7 +135,7 @@ class InstallerCore extends Installer {
 	 * with class_exists() and use an absolute path via $config->paths->wire.
 	 * The rest of the method is identical to the upstream version.
 	 */
-	protected function profileImportSQL($database, $file1, $file2, array $options = []) {
+	public function profileImportSQL($database, $file1, $file2, array $options = []) {
 		$defaults = [
 			'dbEngine' => 'InnoDB',
 			'dbCharset' => 'utf8mb4',
