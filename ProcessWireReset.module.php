@@ -876,6 +876,21 @@ HTMLMODAL;
 				]);
 			}
 
+			// Restore useAsLogin for AdminThemeUikit.
+			// AdminThemeFramework initialises useAsLogin to false. The value
+			// normally comes from the profile's install.sql (a pre-seeded
+			// modules row with data='{"useAsLogin":1}'). Our $modules->refresh()
+			// call above re-scans the filesystem and can overwrite that row with
+			// fresh default data, losing the flag. Re-apply it explicitly —
+			// the same end-state as a fresh PW install via the wizard.
+			if($this->wire('modules')->isInstalled('AdminThemeUikit')) {
+				$atCfg = $this->wire('modules')->getConfig('AdminThemeUikit');
+				if(empty($atCfg['useAsLogin'])) {
+					$atCfg['useAsLogin'] = 1;
+					$this->wire('modules')->saveConfig('AdminThemeUikit', $atCfg);
+				}
+			}
+
 			// Only re-register ProcessWireReset itself directly so PW can autoload
 			// it on the next request. Other kept modules are deferred — their
 			// install() is called in processPendingInstalls() on the next request,
