@@ -823,15 +823,22 @@ HTMLMODAL;
 			$this->wire('pages')->uncacheAll();
 
 			// Step 2: admin account — run the EXACT installer adminAccountSave().
-			// The installer's method reads values from $wire->input->post() which
-			// proxies $_POST, so we populate those now from the backed-up
-			// superuser state instead of from a browser form submission.
+			// The installer reads values from $wire->input->post(). PW's
+			// WireInputData caches $_POST at boot time, so setting $_POST now
+			// would be too late — we must use $wire->input->post->set() to
+			// write directly into WireInputData's internal data array.
+			//
+			// Email: pass empty string so the installer's $sanitizer->email()
+			// check always passes (it rejects non-RFC addresses like
+			// user@localhost). The real email is restored via direct DB UPDATE
+			// after adminAccountSave() returns.
 			$placeholderPass = bin2hex(random_bytes(8)) . 'Aa1!';
-			$_POST['username'] = $superuser['name'];
-			$_POST['userpass'] = $placeholderPass;
-			$_POST['userpass_confirm'] = $placeholderPass;
-			$_POST['useremail'] = $superuser['email'] ?: '';
-			$_POST['admin_name'] = $superuser['admin_name'] ?: 'processwire';
+			$inputPost = $this->wire('input')->post;
+			$inputPost->set('username', $superuser['name']);
+			$inputPost->set('userpass', $placeholderPass);
+			$inputPost->set('userpass_confirm', $placeholderPass);
+			$inputPost->set('useremail', '');
+			$inputPost->set('admin_name', $superuser['admin_name'] ?: 'processwire');
 
 			ob_start();
 			$installer->adminAccountSave($this->wire());
