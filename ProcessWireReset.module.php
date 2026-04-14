@@ -176,16 +176,19 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			if (!$progress) break; // no progress, give up
 		}
 
-		// Restore config/flags for ALL modules from the pending list that
-		// ended up in the DB (including deps auto-installed by PW).
+		// Restore config/flags for modules that had a pre-reset backup.
+		// Modules without backup (transitive dependencies that were never
+		// previously installed) keep their freshly-installed defaults — writing
+		// flags=0 for them would strip the autoload flag and break those modules.
 		foreach ($byClass as $className => $item) {
+			if (!array_key_exists('flags', $item)) continue; // no backup → skip
 			try {
 				$stmt = $database->prepare(
 					"UPDATE modules SET data = :data, flags = :flags WHERE class = :class"
 				);
 				$stmt->execute([
-					':data' => isset($item['data']) ? $item['data'] : '',
-					':flags' => isset($item['flags']) ? (int) $item['flags'] : 0,
+					':data'  => (string) $item['data'],
+					':flags' => (int) $item['flags'],
 					':class' => $className,
 				]);
 			} catch (\Exception $e) {
@@ -884,21 +887,48 @@ HTMLMODAL;
 				$this->wire('log')->save('processwirereset', 'admin_theme restore skipped: ' . $e->getMessage());
 			}
 
-			// 2f. useAsLogin for AdminThemeUikit — read current data, merge in
-			//     PHP, write back. Avoids JSON_SET which requires MySQL 5.7+
-			//     / MariaDB 10.2+ and would throw on older servers.
+			// 2f. AdminThemeUikit: ensure it exists in the modules table and
+			//     has useAsLogin=1 so the login screen uses it.
+			//
+			// The profile install.sql only seeds AdminThemeDefault (not Uikit),
+			// so AdminThemeUikit is typically absent from the fresh modules table.
+			// An UPDATE-only approach would silently do nothing. We therefore
+			// check first and UPSERT: UPDATE if the row is present (e.g. the
+			// site's profile already includes it), INSERT if it is missing.
+			//
+			// Flags/data for the INSERT come from the pre-reset backup stored in
+			// $keptModuleData (backupModuleData always includes AdminThemeUikit).
+			// Fall back to flags=2 (FLAG_SINGULAR, same as AdminThemeDefault) if
+			// no backup was found (fresh install where Uikit wasn't registered).
 			try {
-				$stmt = $database->prepare("SELECT data FROM modules WHERE class = 'AdminThemeUikit'");
+				$stmt = $database->prepare("SELECT data, flags FROM modules WHERE class = 'AdminThemeUikit'");
 				$stmt->execute();
 				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
-				if($row !== false) {
+
+				if ($row !== false) {
+					// Row exists — merge useAsLogin=1 into current data
 					$modData = ($row['data'] !== '' && $row['data'] !== null)
-						? json_decode($row['data'], true)
-						: [];
-					if(!is_array($modData)) $modData = [];
+						? json_decode($row['data'], true) : [];
+					if (!is_array($modData)) $modData = [];
 					$modData['useAsLogin'] = 1;
 					$stmt = $database->prepare("UPDATE modules SET data = :data WHERE class = 'AdminThemeUikit'");
 					$stmt->execute([':data' => json_encode($modData)]);
+				} else {
+					// Not in table yet — INSERT with backed-up data + useAsLogin=1
+					$uikitBackup = isset($keptModuleData['AdminThemeUikit']) ? $keptModuleData['AdminThemeUikit'] : null;
+					$uikitFlags  = $uikitBackup ? (int) $uikitBackup['flags'] : 2;
+					$baseData    = ($uikitBackup && $uikitBackup['data'] !== '')
+						? json_decode($uikitBackup['data'], true) : [];
+					if (!is_array($baseData)) $baseData = [];
+					$baseData['useAsLogin'] = 1;
+					$stmt = $database->prepare(
+						"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
+					);
+					$stmt->execute([
+						':class' => 'AdminThemeUikit',
+						':flags' => $uikitFlags,
+						':data'  => json_encode($baseData),
+					]);
 				}
 			} catch (\Exception $e) {
 				$this->wire('log')->save('processwirereset', 'useAsLogin restore skipped: ' . $e->getMessage());
@@ -1092,7 +1122,10 @@ HTMLMODAL;
 	 * @return array Map of className => ['class' => ..., 'flags' => ..., 'data' => ...]
 	 */
 	protected function backupModuleData($database, array $moduleNames) {
-		$moduleNames = array_unique(array_merge([$this->className()], $moduleNames));
+		// Always include AdminThemeUikit so its flags/data are available for
+		// the useAsLogin restore in executeReset() phase 2f, regardless of
+		// whether the user listed it in keepModules.
+		$moduleNames = array_unique(array_merge([$this->className(), 'AdminThemeUikit'], $moduleNames));
 		$result = [];
 
 		foreach ($moduleNames as $className) {
@@ -2026,14 +2059,6 @@ HTMLMODAL;
 	}
 
 	/**
-	 * Parse the keepDirectories textarea into a set of absolute paths
-	 *
-	 * @param string $textarea Raw textarea content (one path per line)
-	 * @param string $sitePath Absolute path to site/ directory
-	 * @return array Map of absolute path => true
-	 */
-
-	/**
 	 * Get the octal permission for directories
 	 *
 	 * Uses the module config value if set, falls back to PW's $config->chmodDir,
@@ -2062,6 +2087,14 @@ HTMLMODAL;
 		if (empty($val)) $val = '0644';
 		return octdec(ltrim($val, '0') ?: '644');
 	}
+
+	/**
+	 * Parse the keepDirectories textarea into a set of absolute paths
+	 *
+	 * @param string $textarea Raw textarea content (one path per line)
+	 * @param string $sitePath Absolute path to site/ directory
+	 * @return array Map of absolute path => true
+	 */
 	protected function parseKeepDirectories($textarea, $sitePath) {
 		$result = [];
 		$sitePath = rtrim($sitePath, '/') . '/';
