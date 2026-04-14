@@ -531,7 +531,7 @@ document.addEventListener('DOMContentLoaded', function() {
 		var dirsVal = dirsInput ? dirsInput.value.trim() : '';
 		var dirsEl = document.getElementById('pwreset-summary-dirs');
 		if (dirsVal) {
-			var dirLines = dirsVal.split('\n').filter(function(l) {
+			var dirLines = dirsVal.split('\\n').filter(function(l) {
 				return l.trim() && l.trim()[0] !== '#';
 			});
 			if (dirLines.length) {
