@@ -407,135 +407,169 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 *
 	 * The JS intercepts the form submit when the checkbox is checked,
 	 * populates a summary table, and shows the modal. The "Execute Reset"
-	 * button in the modal enables the two hidden fields and re-submits.
+	 * button enables the two hidden fields and re-submits the form.
 	 *
 	 * @param  array $data Current config data
 	 * @return string HTML
 	 */
 	private function buildResetModalMarkup(array $data) {
-		$confirmText  = self::CONFIRM_TEXT;
-		$defaultLabel = $this->_('Bundled default (site-blank)');
+		$btnLabel    = $this->_('Execute Reset');
+		$cancelLabel = $this->_('Cancel');
+		$modalTitle  = $this->_('Confirm Installation Reset');
+		$warningText = $this->_('This will permanently delete all content, fields, templates, uploaded files, and non-kept modules. The current superuser account will be preserved. This action cannot be undone!');
+		$profileLabel = $this->_('Profile');
+		$modulesLabel = $this->_('Modules to keep');
+		$depsLabel    = $this->_('Auto-included dependencies');
+		$dirsLabel    = $this->_('Directories to keep');
+		$chmodLabel   = $this->_('Permissions');
 		$noneLabel    = $this->_('None');
+		$defaultLabel = $this->_('Bundled default (site-blank)');
+		$confirmText  = self::CONFIRM_TEXT;
 
-		// Pre-compute transitive deps so JS can display them in the modal
-		$saved    = isset($data['keepModules']) ? (array) $data['keepModules'] : [];
-		$expanded = $this->expandKeepModules($saved);
-		$deps     = array_values(array_diff($expanded, $saved));
-		$depsJson = json_encode($deps);
+		// Pre-compute transitive dependencies so JS can show them in the modal
+		$savedKeep = isset($data['keepModules']) ? (array) $data['keepModules'] : [];
+		$expanded  = $this->expandKeepModules($savedKeep);
+		$deps      = array_values(array_diff($expanded, $savedKeep));
+		$depsJson  = json_encode($deps) ?: '[]';
 
-		$modal = $this->_('Confirm Installation Reset');
-		$warn  = $this->_('This will permanently delete all content, fields, templates, uploaded files, and non-kept modules. The superuser account is preserved. This cannot be undone!');
-		$exec  = $this->_('Execute Reset');
-		$cancel = $this->_('Cancel');
-		$lProfile = $this->_('Profile');
-		$lModules = $this->_('Modules to keep');
-		$lDeps    = $this->_('Auto-included dependencies');
-		$lDirs    = $this->_('Directories to keep');
-		$lChmod   = $this->_('Permissions');
-
-		return <<<HTML
-<div id="pwreset-modal" uk-modal="bg-close:false;esc-close:false;">
+		$html = <<<HTMLMODAL
+<div id="pwreset-modal" uk-modal="bg-close:false; esc-close:false;">
 	<div class="uk-modal-dialog" style="background:#fff;">
 		<button class="uk-modal-close-default" type="button" uk-close></button>
-		<div class="uk-modal-header"><h2 class="uk-modal-title">{$modal}</h2></div>
+		<div class="uk-modal-header">
+			<h2 class="uk-modal-title">{$modalTitle}</h2>
+		</div>
 		<div class="uk-modal-body">
-			<div class="uk-alert uk-alert-danger">{$warn}</div>
+			<div class="uk-alert uk-alert-danger">
+				{$warningText}
+			</div>
 			<table class="uk-table uk-table-divider uk-table-small uk-margin-top">
-				<tr><th style="width:180px">{$lProfile}</th><td id="pwr-sum-profile"></td></tr>
-				<tr><th>{$lModules}</th><td id="pwr-sum-modules"></td></tr>
-				<tr id="pwr-deps-row" style="display:none"><th>{$lDeps}</th><td id="pwr-sum-deps"></td></tr>
-				<tr><th>{$lDirs}</th><td id="pwr-sum-dirs"></td></tr>
-				<tr><th>{$lChmod}</th><td id="pwr-sum-chmod"></td></tr>
+				<tr><th style="width:180px">{$profileLabel}</th><td id="pwreset-summary-profile"></td></tr>
+				<tr><th>{$modulesLabel}</th><td id="pwreset-summary-modules"></td></tr>
+				<tr id="pwreset-deps-row" style="display:none"><th>{$depsLabel}</th><td id="pwreset-summary-deps"></td></tr>
+				<tr><th>{$dirsLabel}</th><td id="pwreset-summary-dirs"></td></tr>
+				<tr style="border-bottom:none"><th>{$chmodLabel}</th><td id="pwreset-summary-chmod"></td></tr>
 			</table>
 		</div>
 		<div class="uk-modal-footer uk-text-right">
-			<button type="button" class="uk-button uk-button-secondary uk-modal-close">{$cancel}</button>
-			<button type="button" id="pwr-confirm-btn" class="uk-button uk-button-danger">
-				<i class="fa fa-refresh"></i> {$exec}
+			<button type="button" class="uk-button uk-button-secondary uk-modal-close">{$cancelLabel}</button>
+			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-default">
+				<i class="fa fa-refresh"></i> {$btnLabel}
 			</button>
 		</div>
 	</div>
 </div>
 
-<input type="hidden" name="submit_reset"  id="pwr-hidden-submit"  value="" disabled>
-<input type="hidden" name="confirmReset"  id="pwr-hidden-confirm" value="" disabled>
+<input type="hidden" name="submit_reset" id="pwreset-hidden-submit" value="" disabled>
+<input type="hidden" name="confirmReset" id="pwreset-hidden-confirm" value="" disabled>
+
 
 <script>
 document.addEventListener('DOMContentLoaded', function() {
-	var cb      = document.getElementById('pwreset-enable');
-	var btn     = document.getElementById('pwr-confirm-btn');
-	var hSubmit = document.getElementById('pwr-hidden-submit');
-	var hConfirm= document.getElementById('pwr-hidden-confirm');
-	var modal   = document.getElementById('pwreset-modal');
-	if(!cb || !btn || !modal) return;
-	var form = cb.closest('form');
-	if(!form) return;
+	var checkbox = document.getElementById('pwreset-enable');
+	var confirmBtn = document.getElementById('pwreset-confirm-btn');
+	var hiddenSubmit = document.getElementById('pwreset-hidden-submit');
+	var hiddenConfirm = document.getElementById('pwreset-hidden-confirm');
+	var modal = document.getElementById('pwreset-modal');
+	var defaultProfile = '{$defaultLabel}';
+	var noneText = '{$noneLabel}';
+	var confirmText = '{$confirmText}';
 	var confirmed = false;
-	var deps = {$depsJson};
+	var precomputedDeps = {$depsJson};
 
-	function listHtml(items) {
-		return '<ul class="uk-list uk-list-disc uk-margin-remove">'
-			+ items.map(function(i){ return '<li>'+i+'</li>'; }).join('') + '</ul>';
-	}
+	if (!checkbox || !confirmBtn || !modal) return;
+
+	var form = checkbox.closest('form');
+	if (!form) return;
 
 	form.addEventListener('submit', function(e) {
-		if(!cb.checked || confirmed) return;
+		if (!checkbox.checked || confirmed) return;
 		e.preventDefault();
 
 		// Profile
-		var pInput = form.querySelector('[name=profilePath]');
-		document.getElementById('pwr-sum-profile').textContent =
-			(pInput && pInput.value.trim()) ? pInput.value.trim() : '{$defaultLabel}';
+		var profileInput = form.querySelector('[name=profilePath]');
+		var profileVal = profileInput ? profileInput.value.trim() : '';
+		document.getElementById('pwreset-summary-profile').textContent =
+			profileVal ? profileVal : defaultProfile;
 
-		// Modules
-		var mItems = [];
-		form.querySelectorAll('#wrap_keepModules .asmListItem .asmListItemLabel')
-			.forEach(function(el){ mItems.push(el.textContent.trim()); });
-		if(!mItems.length) {
-			var mSel = form.querySelector('[name="keepModules[]"]');
-			if(mSel) Array.from(mSel.options).filter(function(o){ return o.selected; })
-				.forEach(function(o){ mItems.push(o.text||o.value); });
-		}
-		var mEl = document.getElementById('pwr-sum-modules');
-		mEl.innerHTML = mItems.length ? listHtml(mItems) : '{$noneLabel}';
-
-		// Deps
-		var dRow = document.getElementById('pwr-deps-row');
-		if(deps.length) {
-			dRow.style.display = '';
-			document.getElementById('pwr-sum-deps').innerHTML = listHtml(deps);
+		// Modules (from AsmSelect)
+		var moduleItems = [];
+		var asmItems = form.querySelectorAll('#wrap_keepModules .asmListItem .asmListItemLabel');
+		if (asmItems.length) {
+			asmItems.forEach(function(el) { moduleItems.push(el.textContent.trim()); });
 		} else {
-			dRow.style.display = 'none';
+			var moduleSelect = form.querySelector('[name="keepModules[]"]');
+			if (moduleSelect) {
+				for (var i = 0; i < moduleSelect.options.length; i++) {
+					if (moduleSelect.options[i].selected) {
+						moduleItems.push(moduleSelect.options[i].text || moduleSelect.options[i].value);
+					}
+				}
+			}
+		}
+		var modulesEl = document.getElementById('pwreset-summary-modules');
+		if (moduleItems.length) {
+			modulesEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
+				moduleItems.map(function(m) { return '<li>' + m + '</li>'; }).join('') + '</ul>';
+		} else {
+			modulesEl.textContent = noneText;
+		}
+
+		// Auto-included dependencies
+		var depsRow = document.getElementById('pwreset-deps-row');
+		var depsEl = document.getElementById('pwreset-summary-deps');
+		if (precomputedDeps.length > 0) {
+			depsRow.style.display = '';
+			depsEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
+				precomputedDeps.map(function(d) { return '<li>' + d + '</li>'; }).join('') + '</ul>';
+		} else {
+			depsRow.style.display = 'none';
 		}
 
 		// Directories
-		var dInput = form.querySelector('[name=keepDirectories]');
-		var dLines = dInput ? dInput.value.split('\n').filter(function(l){
-			return l.trim() && l.trim()[0] !== '#';
-		}) : [];
-		document.getElementById('pwr-sum-dirs').innerHTML =
-			dLines.length ? listHtml(dLines.map(function(l){ return '<code>'+l.trim()+'</code>'; })) : '{$noneLabel}';
+		var dirsInput = form.querySelector('[name=keepDirectories]');
+		var dirsVal = dirsInput ? dirsInput.value.trim() : '';
+		var dirsEl = document.getElementById('pwreset-summary-dirs');
+		if (dirsVal) {
+			var dirLines = dirsVal.split('\n').filter(function(l) {
+				return l.trim() && l.trim()[0] !== '#';
+			});
+			if (dirLines.length) {
+				dirsEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
+					dirLines.map(function(d) { return '<li><code>' + d.trim() + '</code></li>'; }).join('') + '</ul>';
+			} else {
+				dirsEl.textContent = noneText;
+			}
+		} else {
+			dirsEl.textContent = noneText;
+		}
 
 		// Chmod
-		var cd = form.querySelector('[name=chmodDir]');
-		var cf = form.querySelector('[name=chmodFile]');
-		document.getElementById('pwr-sum-chmod').textContent =
-			'Dirs: ' + ((cd && cd.value.trim()) || (cd && cd.placeholder) || '0755') +
-			', Files: ' + ((cf && cf.value.trim()) || (cf && cf.placeholder) || '0644');
+		var chmodDirInput = form.querySelector('[name=chmodDir]');
+		var chmodFileInput = form.querySelector('[name=chmodFile]');
+		var chmodDirVal = (chmodDirInput && chmodDirInput.value.trim()) || (chmodDirInput ? chmodDirInput.placeholder : '0755');
+		var chmodFileVal = (chmodFileInput && chmodFileInput.value.trim()) || (chmodFileInput ? chmodFileInput.placeholder : '0644');
+		document.getElementById('pwreset-summary-chmod').textContent =
+			'Dirs: ' + chmodDirVal + ', Files: ' + chmodFileVal;
 
 		UIkit.modal(modal).show();
 	});
 
-	btn.addEventListener('click', function() {
+	// Confirm: enable hidden fields, set flag, re-submit
+	confirmBtn.addEventListener('click', function() {
 		confirmed = true;
-		hSubmit.value    = '1';   hSubmit.disabled   = false;
-		hConfirm.value   = '{$confirmText}'; hConfirm.disabled  = false;
+		hiddenSubmit.value = '1';
+		hiddenSubmit.disabled = false;
+		hiddenConfirm.value = confirmText;
+		hiddenConfirm.disabled = false;
 		UIkit.modal(modal).hide();
 		form.submit();
 	});
 });
 </script>
-HTML;
+HTMLMODAL;
+
+		return $html;
 	}
 
 	// =========================================================================
