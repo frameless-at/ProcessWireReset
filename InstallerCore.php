@@ -36,6 +36,12 @@ if(!class_exists('\\ProcessWire\\Installer', false)) {
  */
 class InstallerCore extends Installer {
 
+	// Re-declared public so executeReset() can set them from outside.
+	// (Parent declares them protected; PHP allows widening visibility in
+	// subclasses — protected → public is valid.)
+	public $chmodDir = '0755';
+	public $chmodFile = '0644';
+
 	/** @var string[] Info/ok messages collected during run (replaces echo) */
 	public $messages = [];
 
