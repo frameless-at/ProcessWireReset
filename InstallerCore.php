@@ -1,60 +1,129 @@
 <?php namespace ProcessWire;
 
+// Load the exact upstream Installer class from ProcessWire's install.php.
+// Only lines 1-2117 (the class body) are kept — the procedural self-execution
+// at the bottom (which would immediately run the installer) is stripped.
+// The file is in vendor/Installer.php and stays in the ProcessWire namespace.
+if(!class_exists('\\ProcessWire\\Installer', false)) {
+	require_once __DIR__ . '/vendor/Installer.php';
+}
+
 /**
- * InstallerCore — Headless ProcessWire Installer
+ * InstallerCore — headless extension of ProcessWire's own Installer class.
  *
- * Adapted from ProcessWire's install.php (the Installer class). The wizard
- * GUI is stripped out entirely; only the core processing methods remain:
- * SQL import, admin account creation, and filesystem helpers.
+ * Only the parts that don't work when called from inside a running PW instance
+ * are overridden here:
  *
- * Caller populates this object's properties from the current installation's
- * state (superuser from the DB, profile path from the module config) instead
- * of the user typing values into the installer's setup forms. The methods
- * themselves are kept as close to the originals as practical so behavior
- * matches a fresh install.
+ *  - HTML/output methods (alert, ok, err, h, p, btn, …)
+ *      Silenced — messages collected in $this->messages / $this->errors instead.
  *
- * Upstream reference:
- * https://github.com/processwire/processwire/blob/master/install.php
+ *  - getRemoveableItems()
+ *      Disabled — a reset must not delete install.php or site/install/, since
+ *      those files are needed for subsequent resets.
+ *
+ *  - finish()
+ *      Path corrected — the original uses __DIR__ which would point to the
+ *      module's vendor/ folder. We resolve the path via $config->paths->root.
+ *
+ *  - profileImportSQL()
+ *      require_once replaces require — WireDatabaseBackup is already loaded
+ *      inside a live PW instance; a plain require() would trigger a fatal
+ *      "Cannot redeclare class" error.
+ *
+ * Everything else — especially adminAccountSave(), which calls
+ * getInstall('AdminThemeUikit') and sets useLoginScreen — runs verbatim from
+ * the upstream Installer class.
  */
-class InstallerCore {
+class InstallerCore extends Installer {
 
-	/** @var string Octal directory permission (e.g. '0755') */
-	public $chmodDir = '0755';
-
-	/** @var string Octal file permission (e.g. '0644') */
-	public $chmodFile = '0644';
-
-	/** @var string DB engine for CREATE TABLE rewrites */
-	public $dbEngine = 'InnoDB';
-
-	/** @var string DB charset for CREATE TABLE rewrites */
-	public $dbCharset = 'utf8mb4';
-
-	/** @var string[] Info messages collected during run (replaces echo) */
+	/** @var string[] Info/ok messages collected during run (replaces echo) */
 	public $messages = [];
 
 	/** @var string[] Error messages collected during run (replaces echo) */
 	public $errors = [];
 
+	// ── Output / GUI methods — all silenced ──────────────────────────────
+
+	protected function alert($str, $type = 'primary', $icon = 'check') {}
+	protected function alertOk($str, $icon = 'check') {}
+	protected function alertWarn($str) {}
+	protected function alertErr($str) {
+		$this->numErrors++;
+		$this->errors[] = strip_tags((string) $str);
+	}
+	public function err($str) {
+		$this->numErrors++;
+		$this->errors[] = strip_tags((string) $str);
+		return false;
+	}
+	public function warn($str) {
+		$this->messages[] = 'WARN: ' . strip_tags((string) $str);
+	}
+	public function ok($str, $icon = 'check') {
+		$this->messages[] = strip_tags((string) $str);
+	}
+	public function icon($name, $fw = true) { return ''; }
+	protected function iconize($label, $icon = '') { return strip_tags((string) $label); }
+	public function btn($label, array $options = []) {}
+	public function btnContinue(array $options = []) {}
+	public function h($label, $icon = '') {}
+	public function p($text, $class = '') {}
+	public function input($name, $label, $value, array $options = []) {}
+	public function select($name, $label, $value, array $options, $width = 150) {}
+	protected function selectTimezone($value) { return ''; }
+	public function textarea($name, $label, $value, $rows = 0) {}
+	public function sectionStart($headline = '', $type = 'muted') {}
+	public function sectionStop() {}
+	public function clear() {}
+
+	// ── Reset-specific overrides ──────────────────────────────────────────
+
 	/**
-	 * Import profile SQL dump
+	 * getRemoveableItems — disabled for reset context.
 	 *
-	 * Verbatim port of Installer::profileImportSQL() from install.php.
-	 * Uses WireDatabaseBackup::restoreMerge() with findReplaceCreateTable
-	 * rewrites so the profile SQL's ENGINE/CHARSET match the active DB.
-	 *
-	 * @param \PDO $database PDO or WireDatabasePDO connection
-	 * @param string $file1 Absolute path to core install.sql
-	 * @param string $file2 Absolute path to profile install.sql
-	 * @param array $options Overrides: 'dbEngine', 'dbCharset'
-	 * @throws \RuntimeException on import failure
+	 * The real installer uses this to delete install.php, site/install/, and
+	 * other one-time-use files after a fresh install. During a reset those
+	 * files must be kept: they're the profile that the reset just consumed
+	 * and may be used again for subsequent resets.
 	 */
-	public function profileImportSQL($database, $file1, $file2, array $options = []) {
+	protected function getRemoveableItems($getMarkup = false, $removeNow = false) {
+		return $getMarkup ? '' : [];
+	}
+
+	/**
+	 * finish — path-corrected port of the original.
+	 *
+	 * The upstream version uses __DIR__ which resolves to our vendor/ folder
+	 * when the file is loaded from there. We use $config->paths->root instead
+	 * so site/install/finish.php (e.g. from site-default) is found correctly.
+	 */
+	protected function finish($wire, $user) {
+		$file = $wire->wire('config')->paths->root . 'site/install/finish.php';
+		if(is_file($file)) {
+			$fuel = array_merge($wire->wire('all')->getArray(), ['user' => $user]);
+			$installer = $this;
+			if($installer) {} // suppress "unused variable" notices
+			extract($fuel);
+			include($file);
+		}
+	}
+
+	/**
+	 * profileImportSQL — require_once fix for live-PW context.
+	 *
+	 * The original does plain require("./wire/core/WireDatabaseBackup.php").
+	 * Inside a running ProcessWire instance WireDatabaseBackup is already
+	 * loaded, so a bare require() triggers "Cannot redeclare class". We guard
+	 * with class_exists() and use an absolute path via $config->paths->wire.
+	 * The rest of the method is identical to the upstream version.
+	 */
+	protected function profileImportSQL($database, $file1, $file2, array $options = []) {
 		$defaults = [
-			'dbEngine' => $this->dbEngine,
-			'dbCharset' => $this->dbCharset,
+			'dbEngine' => 'InnoDB',
+			'dbCharset' => 'utf8mb4',
 		];
 		$options = array_merge($defaults, $options);
+		if(self::TEST_MODE) return;
 
 		$restoreOptions = [];
 		$replace = [];
@@ -72,258 +141,20 @@ class InstallerCore {
 				$replace['(255)'] = '(250)';
 			}
 		}
+		if(count($replace)) $restoreOptions['findReplaceCreateTable'] = $replace;
 
-		if(!empty($replace)) $restoreOptions['findReplaceCreateTable'] = $replace;
-
+		// Fix: use require_once + absolute path (plain require() would cause
+		// "Cannot redeclare class WireDatabaseBackup" in a live PW instance)
 		if(!class_exists('\\ProcessWire\\WireDatabaseBackup', false)) {
-			$backupClass = wire('config')->paths->wire . 'core/WireDatabaseBackup.php';
-			require_once $backupClass;
+			require_once wire('config')->paths->wire . 'core/WireDatabaseBackup.php';
 		}
-
 		$backup = new WireDatabaseBackup();
 		$backup->setDatabase($database);
-
 		if($backup->restoreMerge($file1, $file2, $restoreOptions)) {
-			$this->messages[] = "Imported database file: $file1";
-			$this->messages[] = "Imported database file: $file2";
-			return;
-		}
-
-		foreach($backup->errors() as $error) {
-			$this->errors[] = $error;
-		}
-		throw new \RuntimeException(
-			'profileImportSQL failed: ' . implode('; ', $backup->errors())
-		);
-	}
-
-	/**
-	 * Save admin account
-	 *
-	 * Adapted from Installer::adminAccountSave(). The key differences:
-	 * 1. Values come from $params (not $_POST), pre-populated by the caller.
-	 * 2. $passOverride lets the caller write the original hash+salt pair
-	 *    directly to field_pass after the user is saved — necessary for a
-	 *    reset, where we want to preserve the existing superuser login but
-	 *    don't have the plain-text password.
-	 * 3. No echo/HTML output; messages are collected in $this->messages.
-	 *
-	 * @param ProcessWire $wire Bootstrapped PW instance (API vars available)
-	 * @param array $params Admin fields (same keys the installer reads from $_POST):
-	 *   - username   string (required)
-	 *   - userpass   string (required, min 6 chars; ignored if $passOverride set
-	 *                       and a non-empty placeholder is still needed for the
-	 *                       $user->pass setter to validate)
-	 *   - useremail  string
-	 *   - admin_name string (default: 'processwire')
-	 * @param array|null $passOverride Optional ['data' => hash, 'salt' => salt]
-	 *   — when set, field_pass is UPDATEd with these values after $users->save()
-	 *   so the original password hash is preserved across the reset.
-	 * @throws \RuntimeException on validation or save failure
-	 */
-	public function adminAccountSave(ProcessWire $wire, array $params, $passOverride = null) {
-		$sanitizer = $wire->wire('sanitizer');
-		$modules = $wire->wire('modules');
-		$config = $wire->wire('config');
-
-		$adminTheme = $modules->getInstall('AdminThemeUikit');
-
-		if($config->defaultAdminTheme === 'AdminThemeUikit' && $modules->isInstalled('AdminThemeDefault')) {
-			$modules->uninstall('AdminThemeDefault');
-		}
-
-		$usernameRaw = isset($params['username']) ? (string) $params['username'] : '';
-		$userpass = isset($params['userpass']) ? (string) $params['userpass'] : '';
-		$useremail = isset($params['useremail']) ? (string) $params['useremail'] : '';
-		$adminNameRaw = isset($params['admin_name']) ? (string) $params['admin_name'] : 'processwire';
-
-		if($usernameRaw === '' || $userpass === '') {
-			throw new \RuntimeException('adminAccountSave: missing username or password');
-		}
-		if(strlen($userpass) < 6) {
-			throw new \RuntimeException('adminAccountSave: password must be at least 6 characters');
-		}
-
-		$username = $sanitizer->pageName($usernameRaw);
-		if($username !== $usernameRaw) {
-			throw new \RuntimeException("adminAccountSave: username must be only a-z 0-9 (got '$usernameRaw')");
-		}
-		if(strlen($username) < 2) {
-			throw new \RuntimeException('adminAccountSave: username must be at least 2 characters');
-		}
-
-		$adminName = $sanitizer->pageName($adminNameRaw);
-		if($adminName !== $adminNameRaw) {
-			throw new \RuntimeException("adminAccountSave: admin_name must be only a-z 0-9 (got '$adminNameRaw')");
-		}
-		if($adminName === 'wire' || $adminName === 'site') {
-			throw new \RuntimeException("adminAccountSave: admin_name may not be 'wire' or 'site'");
-		}
-		if(strlen($adminName) < 2) {
-			throw new \RuntimeException('adminAccountSave: admin_name must be at least 2 characters');
-		}
-
-		$email = strtolower($sanitizer->email($useremail));
-		if($useremail !== '' && $email !== strtolower($useremail)) {
-			throw new \RuntimeException('adminAccountSave: email did not validate');
-		}
-
-		$superuserRole = $wire->wire('roles')->get('name=superuser');
-		$user = $wire->wire('users')->get($config->superUserPageID);
-
-		if($user && $user->id) {
-			$user->of(false);
+			$this->ok("Imported database file: $file1");
+			$this->ok("Imported database file: $file2");
 		} else {
-			$user = $wire->wire(new User());
-			$user->id = $config->superUserPageID;
+			foreach($backup->errors() as $error) $this->alertErr($error);
 		}
-
-		$user->name = $username;
-		$user->pass = $userpass;
-		$user->email = $email;
-		$user->admin_theme = $adminTheme;
-
-		if(!$user->roles->has('superuser')) $user->roles->add($superuserRole);
-
-		$admin = $wire->wire('pages')->get($config->adminRootPageID);
-		$admin->of(false);
-		$admin->name = $adminName;
-
-		try {
-			$wire->wire('users')->save($user);
-			$wire->wire('pages')->save($admin);
-		} catch(\Exception $e) {
-			throw new \RuntimeException(
-				'adminAccountSave: save failed: ' . $e->getMessage(), 0, $e
-			);
-		}
-
-		// Password hash override — restore the original superuser's hash+salt
-		// directly so the existing login keeps working after the reset.
-		// $user->pass above set a placeholder so PW's validation and save flow
-		// complete normally; we just overwrite the persisted value here.
-		if(is_array($passOverride) && isset($passOverride['data']) && $passOverride['data'] !== '') {
-			$db = $wire->wire('database');
-			$stmt = $db->prepare(
-				'UPDATE field_pass SET data = :data, salt = :salt WHERE pages_id = :id'
-			);
-			$stmt->execute([
-				':data' => $passOverride['data'],
-				':salt' => isset($passOverride['salt']) ? $passOverride['salt'] : '',
-				':id' => (int) $config->superUserPageID,
-			]);
-		}
-
-		// Email override — if the caller passed a raw email that $sanitizer
-		// rejected but we still want to preserve verbatim (e.g. an email
-		// already stored in the DB from a prior install), allow a direct write.
-		if(!empty($params['email_override'])) {
-			$db = $wire->wire('database');
-			$stmt = $db->prepare(
-				'UPDATE field_email SET data = :data WHERE pages_id = :id'
-			);
-			$stmt->execute([
-				':data' => (string) $params['email_override'],
-				':id' => (int) $config->superUserPageID,
-			]);
-		}
-
-		$this->messages[] = "User account saved: {$user->name}";
-
-		// Signal installation completion — same marker PW's installer writes
-		// so the original install.php (if still present) won't re-run.
-		$installedMarker = $config->paths->site . 'assets/installed.php';
-		file_put_contents(
-			$installedMarker,
-			"<?php // The existence of this file prevents the installer from running."
-		);
-	}
-
-	/**
-	 * Create a directory with proper permissions.
-	 * Port of Installer::mkdir().
-	 *
-	 * @param string $path Directory path
-	 * @param bool $block Also write a blocking .htaccess inside
-	 * @return bool
-	 */
-	public function mkdir($path, $block = false) {
-		$path = rtrim($path, '/') . '/';
-		$isDir = is_dir($path);
-		if($isDir || @mkdir($path, octdec($this->chmodDir), true)) {
-			@chmod($path, octdec($this->chmodDir));
-			$result = true;
-		} else {
-			$this->errors[] = "Error creating directory: $path";
-			return false;
-		}
-		if($block) {
-			$file = $path . '.htaccess';
-			if(!file_exists($file)) {
-				$data = [
-					'# Start ProcessWire:pwball (install)',
-					'# Block all access (fallback if root .htaccess missing)',
-					'<IfModule mod_authz_core.c>',
-					'  Require all denied',
-					'</IfModule>',
-					'<IfModule !mod_authz_core.c>',
-					'  Order allow,deny',
-					'  Deny from all',
-					'</IfModule>',
-					'# End ProcessWire:pwball',
-				];
-				file_put_contents($file, implode("\n", $data));
-				@chmod($file, octdec($this->chmodFile));
-			}
-		}
-		return $result;
-	}
-
-	/**
-	 * Copy a single file with chmod.
-	 * Port of Installer::copyFile().
-	 *
-	 * @param string $src
-	 * @param string $dst
-	 * @return bool
-	 */
-	public function copyFile($src, $dst) {
-		if(!@copy($src, $dst)) {
-			$this->errors[] = "Unable to copy $src => $dst";
-			return false;
-		}
-		@chmod($dst, octdec($this->chmodFile));
-		return true;
-	}
-
-	/**
-	 * Recursively copy a directory with chmod on each file.
-	 * Port of Installer::copyRecursive().
-	 *
-	 * @param string $src
-	 * @param string $dst
-	 * @param bool $overwrite
-	 * @return bool
-	 */
-	public function copyRecursive($src, $dst, $overwrite = true) {
-		if(substr($src, -1) !== '/') $src .= '/';
-		if(substr($dst, -1) !== '/') $dst .= '/';
-
-		$dir = @opendir($src);
-		if(!$dir) return false;
-		$this->mkdir($dst);
-
-		while(false !== ($file = readdir($dir))) {
-			if($file === '.' || $file === '..') continue;
-			if(is_dir($src . $file)) {
-				$this->copyRecursive($src . $file, $dst . $file, $overwrite);
-			} else {
-				if(!$overwrite && file_exists($dst . $file)) continue;
-				@copy($src . $file, $dst . $file);
-				@chmod($dst . $file, octdec($this->chmodFile));
-			}
-		}
-		closedir($dir);
-		return true;
 	}
 }

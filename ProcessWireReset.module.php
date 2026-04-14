@@ -822,28 +822,52 @@ HTMLMODAL;
 			$this->wire('modules')->refresh();
 			$this->wire('pages')->uncacheAll();
 
-			// Step 2: admin account (same as PW installer's adminAccountSave
-			// step) — creates the user through PW's API, then overwrites the
-			// password hash + email with the backed-up values so the existing
-			// login keeps working.
+			// Step 2: admin account — run the EXACT installer adminAccountSave().
+			// The installer's method reads values from $wire->input->post() which
+			// proxies $_POST, so we populate those now from the backed-up
+			// superuser state instead of from a browser form submission.
 			$placeholderPass = bin2hex(random_bytes(8)) . 'Aa1!';
-			$installer->adminAccountSave(
-				$this->wire(),
-				[
-					'username' => $superuser['name'],
-					'userpass' => $placeholderPass,
-					'useremail' => $superuser['email'] ?: '',
-					'admin_name' => $superuser['admin_name'] ?: 'processwire',
-					// Write raw email regardless of $sanitizer->email outcome —
-					// preserves whatever was stored before, even if it looks
-					// non-standard (e.g. internal addresses without a TLD).
-					'email_override' => $superuser['email'] ?: '',
-				],
-				[
-					'data' => $superuser['pass_data'],
-					'salt' => $superuser['pass_salt'],
-				]
-			);
+			$_POST['username'] = $superuser['name'];
+			$_POST['userpass'] = $placeholderPass;
+			$_POST['userpass_confirm'] = $placeholderPass;
+			$_POST['useremail'] = $superuser['email'] ?: '';
+			$_POST['admin_name'] = $superuser['admin_name'] ?: 'processwire';
+
+			ob_start();
+			$installer->adminAccountSave($this->wire());
+			ob_end_clean();
+
+			if($installer->numErrors) {
+				throw new WireException(
+					'adminAccountSave failed: ' . implode('; ', $installer->errors)
+				);
+			}
+
+			// Overwrite field_pass with the original hash+salt so the existing
+			// login keeps working. adminAccountSave above stored a placeholder
+			// bcrypt hash; we replace it here with the backed-up credentials.
+			if(!empty($superuser['pass_data'])) {
+				$stmt = $database->prepare(
+					'UPDATE field_pass SET data = :data, salt = :salt WHERE pages_id = :id'
+				);
+				$stmt->execute([
+					':data' => $superuser['pass_data'],
+					':salt' => $superuser['pass_salt'],
+					':id' => (int) $superuser['id'],
+				]);
+			}
+
+			// Preserve original email verbatim (sanitizer may reject non-standard
+			// addresses; we always want to restore exactly what was in the DB).
+			if(!empty($superuser['email'])) {
+				$stmt = $database->prepare(
+					'UPDATE field_email SET data = :data WHERE pages_id = :id'
+				);
+				$stmt->execute([
+					':data' => $superuser['email'],
+					':id' => (int) $superuser['id'],
+				]);
+			}
 
 			// Only re-register ProcessWireReset itself directly so PW can autoload
 			// it on the next request. Other kept modules are deferred — their
