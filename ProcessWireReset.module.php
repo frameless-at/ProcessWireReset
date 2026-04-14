@@ -864,27 +864,45 @@ HTMLMODAL;
 				]);
 			}
 
-			// 2e. Admin theme preference — restore the backed-up value.
-			//     fall back to 'AdminThemeUikit' (standard PW default).
-			$adminThemeVal = !empty($superuser['admin_theme'])
-				? $superuser['admin_theme']
-				: 'AdminThemeUikit';
-			$stmt = $database->prepare(
-				"INSERT INTO field_admin_theme (pages_id, data)
-				 VALUES (:id, :data)
-				 ON DUPLICATE KEY UPDATE data = VALUES(data)"
-			);
-			$stmt->execute([':id' => (int) $superuser['id'], ':data' => $adminThemeVal]);
+			// 2e–2f: best-effort restores — these enhance the result but must
+			// NOT abort the reset if they fail (e.g. table missing, old DB
+			// without JSON functions). Wrap each in its own try/catch so a
+			// failure here never blocks writePendingInstalls below.
 
-			// 2f. useAsLogin for AdminThemeUikit — set directly in the modules
-			//     table data column. Bypasses $modules->saveConfig() which is
-			//     unreliable after a DB reset (stale module cache can overwrite
-			//     the value). JSON_SET keeps any other stored config intact.
-			$database->exec(
-				"UPDATE modules
-				 SET data = JSON_SET(COALESCE(NULLIF(data,''), '{}'), '$.useAsLogin', 1)
-				 WHERE class = 'AdminThemeUikit'"
-			);
+			// 2e. Admin theme preference
+			try {
+				$adminThemeVal = !empty($superuser['admin_theme'])
+					? $superuser['admin_theme']
+					: 'AdminThemeUikit';
+				$stmt = $database->prepare(
+					"INSERT INTO field_admin_theme (pages_id, data)
+					 VALUES (:id, :data)
+					 ON DUPLICATE KEY UPDATE data = VALUES(data)"
+				);
+				$stmt->execute([':id' => (int) $superuser['id'], ':data' => $adminThemeVal]);
+			} catch (\Exception $e) {
+				$this->wire('log')->save('processwirereset', 'admin_theme restore skipped: ' . $e->getMessage());
+			}
+
+			// 2f. useAsLogin for AdminThemeUikit — read current data, merge in
+			//     PHP, write back. Avoids JSON_SET which requires MySQL 5.7+
+			//     / MariaDB 10.2+ and would throw on older servers.
+			try {
+				$stmt = $database->prepare("SELECT data FROM modules WHERE class = 'AdminThemeUikit'");
+				$stmt->execute();
+				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
+				if($row !== false) {
+					$modData = ($row['data'] !== '' && $row['data'] !== null)
+						? json_decode($row['data'], true)
+						: [];
+					if(!is_array($modData)) $modData = [];
+					$modData['useAsLogin'] = 1;
+					$stmt = $database->prepare("UPDATE modules SET data = :data WHERE class = 'AdminThemeUikit'");
+					$stmt->execute([':data' => json_encode($modData)]);
+				}
+			} catch (\Exception $e) {
+				$this->wire('log')->save('processwirereset', 'useAsLogin restore skipped: ' . $e->getMessage());
+			}
 
 			// Only re-register ProcessWireReset itself directly so PW can autoload
 			// it on the next request. Other kept modules are deferred — their
