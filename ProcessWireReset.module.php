@@ -3,149 +3,156 @@
 require_once __DIR__ . '/InstallerCore.php';
 
 /**
- * ProcessWire Reset Module
+ * ProcessWire Reset
  *
- * Resets a ProcessWire installation to a clean profile state.
- * Preserves the current superuser account and selected site modules.
+ * Resets a ProcessWire installation to a clean profile state while preserving
+ * the current superuser account and selected site modules.
  *
- * The reset uses ProcessWire's own installer code (adapted in InstallerCore.php
- * from the upstream install.php) to import the SQL and recreate the admin
- * account — the installer's wizard GUI is skipped, and its variables are
- * populated from the current installation's state (superuser credentials
- * from the DB, profile path + kept modules from the module config). The
- * result is equivalent to a fresh install, with the existing superuser
- * login preserved.
+ * The SQL import uses ProcessWire's own installer code (InstallerCore extends
+ * the upstream Installer class from install.php). The installer wizard GUI is
+ * completely removed; its variables are pre-populated from the live installation.
  *
- * @property string $profilePath Custom path to profile install directory (containing install.sql)
- * @property array $keepModules Module class names to preserve during reset
+ * After a reset, kept modules are re-installed on the next request via a
+ * deferred pending-file mechanism so that PW has a clean bootstrap state.
+ *
+ * @property string   $profilePath     Custom profile directory (contains install/ and templates/)
+ * @property string[] $keepModules     Module class names to preserve
+ * @property string   $keepDirectories One path per line, relative to site/
+ * @property string   $chmodDir        Directory permission override (e.g. "0755")
+ * @property string   $chmodFile       File permission override (e.g. "0644")
  */
 class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
+	/** Confirmation token the user must submit to trigger the reset */
 	const CONFIRM_TEXT = 'CONFIRMED';
+
+	/** Pending module-installs file (written by executeReset, read on next boot) */
 	const PENDING_FILE = '.pending-installs.json';
+
+	/** Pending custom-table-restore file */
 	const PENDING_TABLES_FILE = '.pending-custom-tables.bin';
 
-	/**
-	 * Tracks filesystem operation failures during the reset phase.
-	 * Populated by emptyDirectory(), removeDirectoryRecursive(),
-	 * cleanModulesDirectory(), copyDirectoryRecursive(). Inspected at the
-	 * end of Phase 3 to decide whether to throw a WireException.
-	 *
-	 * @var string[]
-	 */
+	/** @var string[] Filesystem operation failures collected during Phase 3 */
 	protected $fsFailures = [];
+
+	// =========================================================================
+	// Module registration
+	// =========================================================================
 
 	public static function getModuleInfo() {
 		return [
-			'title' => 'ProcessWire Reset',
-			'version' => '0.1.0',
-			'summary' => 'Resets a ProcessWire installation to a clean profile state while preserving the current superuser and selected modules.',
-			'author' => 'frameless',
-			'icon' => 'refresh',
+			'title'    => 'ProcessWire Reset',
+			'version'  => '1.0.0',
+			'summary'  => 'Resets a ProcessWire installation to a clean profile state while preserving the superuser and selected modules.',
+			'author'   => 'frameless',
+			'icon'     => 'refresh',
 			'singular' => true,
-			// Conditional autoload: only load automatically when there are
-			// pending tasks (module installs or custom-table restore) to
-			// process after a reset.
+			// Only autoload when there are deferred tasks from a previous reset.
 			'autoload' => function() {
-				return file_exists(__DIR__ . '/.pending-installs.json')
-					|| file_exists(__DIR__ . '/.pending-custom-tables.bin');
+				return file_exists(__DIR__ . '/' . self::PENDING_FILE)
+				    || file_exists(__DIR__ . '/' . self::PENDING_TABLES_FILE);
 			},
-			'requires' => [
-				'ProcessWire>=3.0.0',
-			],
+			'requires' => ['ProcessWire>=3.0.0'],
 		];
 	}
 
 	public function __construct() {
 		parent::__construct();
-		$this->set('profilePath', '');
-		$this->set('keepModules', []);
+		$this->set('profilePath',     '');
+		$this->set('keepModules',     []);
 		$this->set('keepDirectories', '');
-		$this->set('chmodDir', '');
-		$this->set('chmodFile', '');
+		$this->set('chmodDir',        '');
+		$this->set('chmodFile',       '');
 	}
 
+	// =========================================================================
+	// Lifecycle — deferred post-reset tasks
+	// =========================================================================
+
 	/**
-	 * Initialize — processes pending tasks from a previous reset if present
-	 *
-	 * When a reset has kept modules, their re-install and custom-table
-	 * restore is deferred to the next request (when PW has a clean state).
-	 * The pending files trigger conditional autoload, and init() schedules
-	 * the processing hook.
+	 * Triggered on every boot when pending files exist (conditional autoload).
+	 * Schedules processPendingInstalls() to run after PW is fully ready.
 	 */
 	public function init() {
-		$pendingInstalls = file_exists(__DIR__ . '/' . self::PENDING_FILE);
-		$pendingTables = file_exists(__DIR__ . '/' . self::PENDING_TABLES_FILE);
-		if (!$pendingInstalls && !$pendingTables) return;
-
-		// Process after PW is fully ready so installModule() has a clean API
+		if(!file_exists(__DIR__ . '/' . self::PENDING_FILE)
+		&& !file_exists(__DIR__ . '/' . self::PENDING_TABLES_FILE)) return;
 		$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
 	}
 
 	/**
-	 * Process deferred module installs from the pending file
+	 * Install kept modules and restore their configuration.
 	 *
-	 * Runs each kept module's install() method (which creates admin pages,
-	 * DB tables, custom fields, etc.) and then restores the backed-up
-	 * config/flags to modules.data.
+	 * Runs on the first request after a reset. PW has a clean bootstrap at
+	 * this point so $modules->install() works correctly.
+	 *
+	 * Algorithm:
+	 *   1. Read + delete pending file (delete first to prevent infinite retries).
+	 *   2. Elevate to superuser so install() has full permissions.
+	 *   3. Refresh the modules cache so PW rediscovers all files.
+	 *   4. Multi-pass install loop — retries modules whose dependencies were not
+	 *      ready in an earlier pass. "Duplicate entry" = already auto-installed
+	 *      as a dependency → treat as success.
+	 *   5. Restore backed-up data + flags for every module that had a backup.
+	 *      Skip modules without backup (new transitive deps): their fresh-install
+	 *      defaults are correct and we must not zero-out their autoload flags.
+	 *   6. Restore custom tables (after all installs so CREATE TABLE conflicts
+	 *      from install() calls are overwritten by the real backed-up data).
 	 */
 	public function processPendingInstalls() {
 		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
-		if (!file_exists($pendingFile)) return;
-
-		$contents = file_get_contents($pendingFile);
-		$pending = $contents !== false ? json_decode($contents, true) : null;
-
-		// Delete file first to prevent infinite retries on error.
-		// If deletion fails (rare), log but continue — the worst case is one
-		// extra attempt on the next request, not an infinite loop.
-		if (!unlink($pendingFile)) {
-			$this->wire('log')->error("ProcessWireReset: Could not remove pending file: $pendingFile");
+		if(!file_exists($pendingFile)) {
+			$this->processPendingCustomTables($this->wire('database'));
+			return;
 		}
 
-		if (!is_array($pending) || empty($pending)) return;
+		$raw     = file_get_contents($pendingFile);
+		$pending = ($raw !== false) ? json_decode($raw, true) : null;
 
-		// Index pending by class name
+		// Delete before processing — worst case is one extra attempt, not a loop
+		if(!unlink($pendingFile)) {
+			$this->wire('log')->error("ProcessWireReset: cannot remove $pendingFile");
+		}
+
+		if(!is_array($pending) || empty($pending)) {
+			$this->processPendingCustomTables($this->wire('database'));
+			return;
+		}
+
+		// Index by class name, exclude self
 		$byClass = [];
-		foreach ($pending as $item) {
-			if (!empty($item['class']) && $item['class'] !== $this->className()) {
+		foreach($pending as $item) {
+			if(!empty($item['class']) && $item['class'] !== $this->className()) {
 				$byClass[$item['class']] = $item;
 			}
 		}
-		if (empty($byClass)) return;
 
-		$modules = $this->wire('modules');
 		$database = $this->wire('database');
-		$config = $this->wire('config');
-		$log = $this->wire('log');
+		$modules  = $this->wire('modules');
+		$log      = $this->wire('log');
 
-		// Temporarily elevate to superuser for install operations
-		$savedUser = $this->wire('user');
-		$superuser = $this->wire('users')->get($config->superUserPageID);
-		if ($superuser && $superuser->id) {
-			$this->wire('user', $superuser);
-		}
+		// Elevate to superuser for install operations
+		$savedUser  = $this->wire('user');
+		$superuser  = $this->wire('users')->get($this->wire('config')->superUserPageID);
+		if($superuser && $superuser->id) $this->wire('user', $superuser);
 
-		// Refresh modules cache so PW rediscovers module files
 		$modules->refresh();
 
-		// Multi-pass install: if a module fails because its dependency isn't
-		// ready yet, retry in a later pass. Handles duplicate-entry errors as
-		// success (PW may have auto-installed a dependency already).
+		// Multi-pass install — a module may fail because its dependency isn't
+		// installed yet; retry in the next pass until no more progress is made.
 		$remaining = array_keys($byClass);
 		$installed = [];
-		$failed = [];
+		$failed    = [];
 		$maxPasses = count($remaining) + 2;
 
-		for ($pass = 0; $pass < $maxPasses && !empty($remaining); $pass++) {
+		for($pass = 0; $pass < $maxPasses && !empty($remaining); $pass++) {
 			$nextRemaining = [];
-			$progress = false;
+			$progress      = false;
 
-			foreach ($remaining as $className) {
-				// Check DB directly (bypasses PW's possibly-stale cache)
-				$stmt = $database->prepare("SELECT id FROM modules WHERE class = :class");
-				$stmt->execute([':class' => $className]);
-				if ($stmt->fetch()) {
+			foreach($remaining as $className) {
+				// Check DB directly (bypasses stale in-memory cache)
+				$stmt = $database->prepare("SELECT id FROM modules WHERE class = :c");
+				$stmt->execute([':c' => $className]);
+				if($stmt->fetch()) {
 					$installed[$className] = true;
 					$progress = true;
 					continue;
@@ -156,114 +163,95 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 					$modules->refresh();
 					$installed[$className] = true;
 					$progress = true;
-				} catch (\Exception $e) {
+				} catch(\Exception $e) {
 					$msg = $e->getMessage();
-					// Duplicate entry means the module was auto-installed as
-					// a dependency during a sibling's install(). Treat as success.
-					if (stripos($msg, 'Duplicate entry') !== false) {
+					// Duplicate entry = auto-installed as dep → success
+					if(stripos($msg, 'Duplicate entry') !== false) {
 						$installed[$className] = true;
 						$progress = true;
 						$modules->refresh();
 					} else {
-						// Retry in next pass — a dependency may get installed meanwhile
-						$nextRemaining[] = $className;
-						$failed[$className] = $msg;
+						$nextRemaining[]      = $className;
+						$failed[$className]   = $msg;
 					}
 				}
 			}
 
 			$remaining = $nextRemaining;
-			if (!$progress) break; // no progress, give up
+			if(!$progress) break;
 		}
 
-		// Restore config/flags for modules that had a pre-reset backup.
-		// Modules without backup (transitive dependencies that were never
-		// previously installed) keep their freshly-installed defaults — writing
-		// flags=0 for them would strip the autoload flag and break those modules.
-		foreach ($byClass as $className => $item) {
-			if (!array_key_exists('flags', $item)) continue; // no backup → skip
+		// Restore backed-up data + flags.
+		// Skip items without a 'flags' key — those are transitive dependencies
+		// that had no pre-reset entry; overwriting flags=0 would break autoload.
+		foreach($byClass as $className => $item) {
+			if(!array_key_exists('flags', $item)) continue;
 			try {
-				$stmt = $database->prepare(
+				$database->prepare(
 					"UPDATE modules SET data = :data, flags = :flags WHERE class = :class"
-				);
-				$stmt->execute([
+				)->execute([
 					':data'  => (string) $item['data'],
-					':flags' => (int) $item['flags'],
+					':flags' => (int)    $item['flags'],
 					':class' => $className,
 				]);
-			} catch (\Exception $e) {
-				$log->save('processwirereset', "Failed to restore config for $className: " . $e->getMessage());
+			} catch(\Exception $e) {
+				$log->save('processwirereset', "Config restore failed for $className: " . $e->getMessage());
 			}
 		}
 
 		// Log summary
-		if (!empty($installed)) {
-			$log->save('processwirereset', "Re-installed kept modules: " . implode(', ', array_keys($installed)));
+		if(!empty($installed)) {
+			$log->save('processwirereset', 'Re-installed: ' . implode(', ', array_keys($installed)));
 		}
-		foreach ($remaining as $className) {
-			$reason = isset($failed[$className]) ? $failed[$className] : 'unknown';
-			$log->save('processwirereset', "Failed to install kept module $className: $reason");
+		foreach($remaining as $className) {
+			$log->save('processwirereset', "Install failed for $className: " . ($failed[$className] ?? 'unknown'));
 		}
 
-		// Restore custom tables AFTER all module installs completed. Each
-		// install() may have created empty versions of the tables we backed
-		// up — restoreCustomTables() drops the fresh versions and recreates
-		// them from the backup, preserving user data (matrix types, login
-		// throttle counters, log rows, etc.).
+		// Restore custom tables after all module installs
 		$this->processPendingCustomTables($database);
 
-		// Restore user context
 		$this->wire('user', $savedUser);
 	}
 
 	/**
-	 * Read the pending custom tables file and restore its contents
-	 *
-	 * Deletes the file after processing to prevent retries on the next
-	 * request.
+	 * Read the pending custom-tables file and restore backed-up table data.
+	 * Runs at the end of processPendingInstalls() — after all install() calls
+	 * have created their (empty) fresh tables, we overwrite them with real data.
 	 *
 	 * @param WireDatabasePDO $database
 	 */
 	protected function processPendingCustomTables($database) {
-		$pendingTablesFile = __DIR__ . '/' . self::PENDING_TABLES_FILE;
-		if (!file_exists($pendingTablesFile)) return;
+		$file = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+		if(!file_exists($file)) return;
 
-		$raw = file_get_contents($pendingTablesFile);
-
-		// Delete file first to prevent retries on error
-		if (!unlink($pendingTablesFile)) {
-			$this->wire('log')->error("ProcessWireReset: Could not remove pending tables file: $pendingTablesFile");
+		$raw = file_get_contents($file);
+		if(!unlink($file)) {
+			$this->wire('log')->error("ProcessWireReset: cannot remove $file");
 		}
+		if($raw === false || $raw === '') return;
 
-		if ($raw === false || $raw === '') return;
-
-		// Serialized PHP — any non-object classes; allowed_classes = false
-		$customTables = @unserialize($raw, ['allowed_classes' => false]);
-		if (!is_array($customTables) || empty($customTables)) return;
+		$tables = @unserialize($raw, ['allowed_classes' => false]);
+		if(!is_array($tables) || empty($tables)) return;
 
 		try {
-			$restored = $this->restoreCustomTables($database, $customTables);
-			if (!empty($restored)) {
-				$this->wire('log')->save(
-					'processwirereset',
-					'Restored custom tables: ' . implode(', ', $restored)
-				);
+			$restored = $this->restoreCustomTables($database, $tables);
+			if(!empty($restored)) {
+				$this->wire('log')->save('processwirereset', 'Restored tables: ' . implode(', ', $restored));
 			}
-		} catch (\Exception $e) {
-			$this->wire('log')->error(
-				'ProcessWireReset: Custom table restore failed: ' . $e->getMessage()
-			);
+		} catch(\Exception $e) {
+			$this->wire('log')->error('ProcessWireReset: table restore failed: ' . $e->getMessage());
 		}
 	}
 
+	// =========================================================================
+	// Module Config GUI
+	// =========================================================================
+
 	/**
-	 * Module config screen entry point
+	 * Entry point for PW's module config system.
+	 * Handles the POST reset action, then returns the config form.
 	 *
-	 * Delegates to two helpers: handleResetPostRequest() for POST handling
-	 * (executes the reset if the user confirmed) and buildConfigInputfields()
-	 * for the actual form construction.
-	 *
-	 * @param array $data Saved config data
+	 * @param  array $data Saved module config
 	 * @return InputfieldWrapper
 	 */
 	public function getModuleConfigInputfields(array $data) {
@@ -272,318 +260,135 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Build the HTML for the reset confirmation modal
+	 * If the reset form was submitted (submit_reset=1, confirmReset=CONFIRMED),
+	 * execute the reset. Otherwise do nothing.
 	 *
-	 * @param array $data Current config data
-	 * @return string Complete modal HTML + hidden fields + script
-	 */
-	private function buildResetModalMarkup(array $data) {
-		$btnLabel = $this->_('Execute Reset');
-		$cancelLabel = $this->_('Cancel');
-		$modalTitle = $this->_('Confirm Installation Reset');
-		$warningText = $this->_('This will permanently delete all content, fields, templates, uploaded files, and non-kept modules. The current superuser account will be preserved. This action cannot be undone!');
-		$profileLabel = $this->_('Profile');
-		$modulesLabel = $this->_('Modules to keep');
-		$depsLabel = $this->_('Auto-included dependencies');
-		$dirsLabel = $this->_('Directories to keep');
-		$chmodLabel = $this->_('Permissions');
-		$noneLabel = $this->_('None');
-		$defaultLabel = $this->_('Bundled default (site-blank)');
-		$confirmText = self::CONFIRM_TEXT;
-
-		// Pre-compute transitive dependencies so JS can show them
-		$savedKeep = isset($data['keepModules']) ? (array) $data['keepModules'] : [];
-		$expanded = $this->expandKeepModules($savedKeep);
-		$deps = array_values(array_diff($expanded, $savedKeep));
-		$depsJson = json_encode($deps);
-
-		$html = <<<HTMLMODAL
-<div id="pwreset-modal" uk-modal="bg-close:false; esc-close:false;">
-	<div class="uk-modal-dialog" style="background:#fff;">
-		<button class="uk-modal-close-default" type="button" uk-close></button>
-		<div class="uk-modal-header">
-			<h2 class="uk-modal-title">{$modalTitle}</h2>
-		</div>
-		<div class="uk-modal-body">
-			<div class="uk-alert uk-alert-danger">
-				{$warningText}
-			</div>
-			<table class="uk-table uk-table-divider uk-table-small uk-margin-top">
-				<tr><th style="width:180px">{$profileLabel}</th><td id="pwreset-summary-profile"></td></tr>
-				<tr><th>{$modulesLabel}</th><td id="pwreset-summary-modules"></td></tr>
-				<tr id="pwreset-deps-row" style="display:none"><th>{$depsLabel}</th><td id="pwreset-summary-deps"></td></tr>
-				<tr><th>{$dirsLabel}</th><td id="pwreset-summary-dirs"></td></tr>
-				<tr style="border-bottom:none"><th>{$chmodLabel}</th><td id="pwreset-summary-chmod"></td></tr>
-			</table>
-		</div>
-		<div class="uk-modal-footer uk-text-right">
-			<button type="button" class="uk-button uk-button-secondary uk-modal-close">{$cancelLabel}</button>
-			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-default">
-				<i class="fa fa-refresh"></i> {$btnLabel}
-			</button>
-		</div>
-	</div>
-</div>
-
-<input type="hidden" name="submit_reset" id="pwreset-hidden-submit" value="" disabled>
-<input type="hidden" name="confirmReset" id="pwreset-hidden-confirm" value="" disabled>
-
-
-<script>
-document.addEventListener('DOMContentLoaded', function() {
-	var checkbox = document.getElementById('pwreset-enable');
-	var confirmBtn = document.getElementById('pwreset-confirm-btn');
-	var hiddenSubmit = document.getElementById('pwreset-hidden-submit');
-	var hiddenConfirm = document.getElementById('pwreset-hidden-confirm');
-	var modal = document.getElementById('pwreset-modal');
-	var defaultProfile = '{$defaultLabel}';
-	var noneText = '{$noneLabel}';
-	var confirmText = '{$confirmText}';
-	var confirmed = false;
-	var precomputedDeps = {$depsJson};
-
-	if (!checkbox || !confirmBtn || !modal) return;
-
-	var form = checkbox.closest('form');
-	if (!form) return;
-
-	form.addEventListener('submit', function(e) {
-		if (!checkbox.checked || confirmed) return;
-		e.preventDefault();
-
-		// Profile
-		var profileInput = form.querySelector('[name=profilePath]');
-		var profileVal = profileInput ? profileInput.value.trim() : '';
-		document.getElementById('pwreset-summary-profile').textContent =
-			profileVal ? profileVal : defaultProfile;
-
-		// Modules (from AsmSelect)
-		var moduleItems = [];
-		var asmItems = form.querySelectorAll('#wrap_keepModules .asmListItem .asmListItemLabel');
-		if (asmItems.length) {
-			asmItems.forEach(function(el) { moduleItems.push(el.textContent.trim()); });
-		} else {
-			var moduleSelect = form.querySelector('[name="keepModules[]"]');
-			if (moduleSelect) {
-				for (var i = 0; i < moduleSelect.options.length; i++) {
-					if (moduleSelect.options[i].selected) {
-						moduleItems.push(moduleSelect.options[i].text || moduleSelect.options[i].value);
-					}
-				}
-			}
-		}
-		var modulesEl = document.getElementById('pwreset-summary-modules');
-		if (moduleItems.length) {
-			modulesEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
-				moduleItems.map(function(m) { return '<li>' + m + '</li>'; }).join('') + '</ul>';
-		} else {
-			modulesEl.textContent = noneText;
-		}
-
-		// Auto-included dependencies
-		var depsRow = document.getElementById('pwreset-deps-row');
-		var depsEl = document.getElementById('pwreset-summary-deps');
-		if (precomputedDeps.length > 0) {
-			depsRow.style.display = '';
-			depsEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
-				precomputedDeps.map(function(d) { return '<li>' + d + '</li>'; }).join('') + '</ul>';
-		} else {
-			depsRow.style.display = 'none';
-		}
-
-		// Directories
-		var dirsInput = form.querySelector('[name=keepDirectories]');
-		var dirsVal = dirsInput ? dirsInput.value.trim() : '';
-		var dirsEl = document.getElementById('pwreset-summary-dirs');
-		if (dirsVal) {
-			var dirLines = dirsVal.split('\\n').filter(function(l) {
-				return l.trim() && l.trim()[0] !== '#';
-			});
-			if (dirLines.length) {
-				dirsEl.innerHTML = '<ul class="uk-list uk-list-disc uk-margin-remove">' +
-					dirLines.map(function(d) { return '<li><code>' + d.trim() + '</code></li>'; }).join('') + '</ul>';
-			} else {
-				dirsEl.textContent = noneText;
-			}
-		} else {
-			dirsEl.textContent = noneText;
-		}
-
-		// Chmod — always show both values
-		var chmodDirInput = form.querySelector('[name=chmodDir]');
-		var chmodFileInput = form.querySelector('[name=chmodFile]');
-		var chmodDirVal = (chmodDirInput && chmodDirInput.value.trim()) || (chmodDirInput ? chmodDirInput.placeholder : '0755');
-		var chmodFileVal = (chmodFileInput && chmodFileInput.value.trim()) || (chmodFileInput ? chmodFileInput.placeholder : '0644');
-		document.getElementById('pwreset-summary-chmod').textContent =
-			'Dirs: ' + chmodDirVal + ', Files: ' + chmodFileVal;
-
-		UIkit.modal(modal).show();
-	});
-
-	// Confirm: enable hidden fields, set flag, re-submit
-	confirmBtn.addEventListener('click', function() {
-		confirmed = true;
-		hiddenSubmit.value = '1';
-		hiddenSubmit.disabled = false;
-		hiddenConfirm.value = confirmText;
-		hiddenConfirm.disabled = false;
-		UIkit.modal(modal).hide();
-		form.submit();
-	});
-});
-</script>
-HTMLMODAL;
-
-		return $html;
-	}
-
-	/**
-	 * Detect and execute the reset action from POST data
-	 *
-	 * The modal sets two hidden fields: submit_reset=1 and confirmReset=CONFIRMED.
-	 * Both must be present for the reset to proceed.
-	 *
-	 * @param array $data Saved config data
+	 * @param array $data
 	 */
 	private function handleResetPostRequest(array $data) {
 		$input = $this->wire('input');
-		if (!$input->requestMethod('POST')) return;
-		if ($input->post('submit_reset') === null) return;
-		if ($input->post('confirmReset') !== self::CONFIRM_TEXT) return;
-
+		if(!$input->requestMethod('POST')) return;
+		if($input->post('submit_reset') === null) return;
+		if($input->post('confirmReset') !== self::CONFIRM_TEXT) return;
 		$this->executeReset($data);
 	}
 
 	/**
-	 * Build the InputfieldWrapper for the module config screen
+	 * Build the InputfieldWrapper for the module config screen.
 	 *
-	 * @param array $data Saved config data (may be missing keys for fresh installs)
+	 * @param  array $data Saved config (may be missing keys on fresh install)
 	 * @return InputfieldWrapper
 	 */
 	private function buildConfigInputfields(array $data) {
-		// Merge with defaults — modules.data can be empty on fresh install
 		$data = array_merge([
-			'profilePath' => '',
-			'keepModules' => [],
+			'profilePath'     => '',
+			'keepModules'     => [],
 			'keepDirectories' => '',
-		'chmodDir' => '',
-		'chmodFile' => '',
+			'chmodDir'        => '',
+			'chmodFile'       => '',
 		], $data);
 
-		$modules = $this->wire('modules');
+		$modules    = $this->wire('modules');
 		$inputfields = $this->wire(new InputfieldWrapper());
 
-		// ── Profile Settings ─────────────────────────────────────────────
-
+		// ── Profile ───────────────────────────────────────────────────────────
 		/** @var InputfieldFieldset $fs */
 		$fs = $modules->get('InputfieldFieldset');
 		$fs->label = $this->_('Profile Settings');
-		$fs->icon = 'database';
+		$fs->icon  = 'database';
 		$inputfields->add($fs);
 
 		/** @var InputfieldText $f */
 		$f = $modules->get('InputfieldText');
-		$f->attr('name', 'profilePath');
+		$f->attr('name',  'profilePath');
 		$f->attr('value', $data['profilePath']);
-		$f->label = $this->_('Custom Profile');
-		$f->description = $this->_('Path to a profile directory (containing install/ and templates/ subdirectories). Relative paths are resolved from the PW root. Leave empty to use the bundled default (site-blank).');
-		$f->notes = $this->_('Example: site-rockfrontend');
-		$f->collapsed = Inputfield::collapsedBlank;
+		$f->label       = $this->_('Custom Profile');
+		$f->description = $this->_('Path to a profile directory containing install/ and templates/. Relative paths resolve from PW root. Leave empty for the bundled default (site-blank).');
+		$f->notes       = $this->_('Example: site-rockfrontend');
+		$f->collapsed   = Inputfield::collapsedBlank;
 		$fs->add($f);
 
-		// ── Modules to Keep ──────────────────────────────────────────────
-
-		/** @var InputfieldFieldset $fs */
+		// ── Modules to Keep ───────────────────────────────────────────────────
 		$fs = $modules->get('InputfieldFieldset');
 		$fs->label = $this->_('Modules to Keep');
-		$fs->icon = 'plug';
+		$fs->icon  = 'plug';
 		$inputfields->add($fs);
 
 		/** @var InputfieldAsmSelect $f */
 		$f = $modules->get('InputfieldAsmSelect');
 		$f->attr('name', 'keepModules');
-		$f->label = $this->_('Select modules to preserve during reset');
-		$f->description = $this->_('These site modules and their files will survive the reset. ProcessWireReset is always preserved automatically.');
-		$f->notes = $this->_('Transitive site-module dependencies are automatically included — selecting a module also preserves any modules it requires.');
+		$f->label       = $this->_('Select modules to preserve during reset');
+		$f->description = $this->_('These site modules and their files survive the reset. ProcessWireReset is always preserved automatically.');
+		$f->notes       = $this->_('Transitive site-module dependencies are automatically included.');
 
 		$siteModulesPath = $this->wire('config')->paths->siteModules;
-		foreach ($modules as $module) {
+		foreach($modules as $module) {
 			$className = $module->className();
-			if ($className === $this->className()) continue;
+			if($className === $this->className()) continue;
 			$path = $modules->getModuleFile($module);
-			if ($path && strpos($path, $siteModulesPath) === 0) {
-				$info = $modules->getModuleInfoVerbose($module);
-				$version = isset($info['version']) ? $info['version'] : '?';
-				$f->addOption($className, "$className (v$version)");
-			}
+			if(!$path || strpos($path, $siteModulesPath) !== 0) continue;
+			$info    = $modules->getModuleInfoVerbose($module);
+			$version = $info['version'] ?? '?';
+			$f->addOption($className, "$className (v$version)");
 		}
-
 		$f->attr('value', $data['keepModules']);
 		$fs->add($f);
 
-		// ── Directories to Keep ──────────────────────────────────────────
-
-		/** @var InputfieldFieldset $fs */
+		// ── Directories to Keep ───────────────────────────────────────────────
 		$fs = $modules->get('InputfieldFieldset');
 		$fs->label = $this->_('Directories to Keep');
-		$fs->icon = 'folder-o';
+		$fs->icon  = 'folder-o';
 		$inputfields->add($fs);
 
 		/** @var InputfieldTextarea $f */
 		$f = $modules->get('InputfieldTextarea');
-		$f->attr('name', 'keepDirectories');
+		$f->attr('name',  'keepDirectories');
 		$f->attr('value', $data['keepDirectories']);
-		$f->attr('rows', 5);
-		$f->label = $this->_('Additional directories to preserve during reset');
-		$f->description = $this->_('One path per line, relative to the site/ directory. These directories and their contents will not be deleted.');
-		$f->notes = $this->_("Examples:\ntemplates/RockIcons\nassets/TracyDebugger\nassets/backups");
-		$f->collapsed = Inputfield::collapsedBlank;
+		$f->attr('rows',  5);
+		$f->label       = $this->_('Additional directories to preserve (relative to site/)');
+		$f->description = $this->_('One path per line. Lines starting with # are ignored.');
+		$f->notes       = $this->_("Examples:\ntemplates/RockIcons\nassets/TracyDebugger\nassets/backups");
+		$f->collapsed   = Inputfield::collapsedBlank;
 		$fs->add($f);
 
-		// ── File Permissions ─────────────────────────────────────────────
-
-		/** @var InputfieldFieldset $fs */
+		// ── File Permissions ──────────────────────────────────────────────────
 		$fs = $modules->get('InputfieldFieldset');
-		$fs->label = $this->_('File Permissions');
-		$fs->icon = 'lock';
+		$fs->label     = $this->_('File Permissions');
+		$fs->icon      = 'lock';
 		$fs->collapsed = Inputfield::collapsedYes;
 		$inputfields->add($fs);
 
-		$pwChmodDir = $this->wire('config')->chmodDir;
+		$pwChmodDir  = $this->wire('config')->chmodDir;
 		$pwChmodFile = $this->wire('config')->chmodFile;
 
 		/** @var InputfieldText $f */
 		$f = $modules->get('InputfieldText');
-		$f->attr('name', 'chmodDir');
-		$f->attr('value', $data['chmodDir']);
-		$f->label = $this->_('Directory permissions');
-		$f->description = $this->_('Octal permission for created directories.');
-		$f->notes = sprintf($this->_('Leave empty to use PW config value: %s'), $pwChmodDir ?: '0755');
+		$f->attr('name',        'chmodDir');
+		$f->attr('value',       $data['chmodDir']);
 		$f->attr('placeholder', $pwChmodDir ?: '0755');
+		$f->label       = $this->_('Directory permissions');
+		$f->notes       = sprintf($this->_('Leave empty to use PW config: %s'), $pwChmodDir ?: '0755');
 		$f->columnWidth = 50;
 		$fs->add($f);
 
-		/** @var InputfieldText $f */
 		$f = $modules->get('InputfieldText');
-		$f->attr('name', 'chmodFile');
-		$f->attr('value', $data['chmodFile']);
-		$f->label = $this->_('File permissions');
-		$f->description = $this->_('Octal permission for created/copied files.');
-		$f->notes = sprintf($this->_('Leave empty to use PW config value: %s'), $pwChmodFile ?: '0644');
+		$f->attr('name',        'chmodFile');
+		$f->attr('value',       $data['chmodFile']);
 		$f->attr('placeholder', $pwChmodFile ?: '0644');
+		$f->label       = $this->_('File permissions');
+		$f->notes       = sprintf($this->_('Leave empty to use PW config: %s'), $pwChmodFile ?: '0644');
 		$f->columnWidth = 50;
 		$fs->add($f);
 
-		// ── Execute Reset ────────────────────────────────────────────────
-
+		// ── Execute Reset ─────────────────────────────────────────────────────
 		/** @var InputfieldCheckbox $f */
 		$f = $modules->get('InputfieldCheckbox');
-		$f->attr('name', 'enableReset');
-		$f->attr('id', 'pwreset-enable');
+		$f->attr('name',  'enableReset');
+		$f->attr('id',    'pwreset-enable');
 		$f->attr('value', 1);
-		$f->label = $this->_('I want to reset this installation');
-		$f->description = $this->_('A confirmation dialog will show a summary of all settings before executing.');
-		$f->icon = 'exclamation-triangle';
+		$f->label       = $this->_('I want to reset this installation');
+		$f->description = $this->_('A confirmation dialog will summarise all settings before executing.');
+		$f->icon        = 'exclamation-triangle';
 		$inputfields->add($f);
 
 		/** @var InputfieldMarkup $f */
@@ -597,475 +402,430 @@ HTMLMODAL;
 		return $inputfields;
 	}
 
-	// =====================================================================
+	/**
+	 * Build the UIkit confirmation modal markup + hidden fields + JS.
+	 *
+	 * The JS intercepts the form submit when the checkbox is checked,
+	 * populates a summary table, and shows the modal. The "Execute Reset"
+	 * button in the modal enables the two hidden fields and re-submits.
+	 *
+	 * @param  array $data Current config data
+	 * @return string HTML
+	 */
+	private function buildResetModalMarkup(array $data) {
+		$confirmText  = self::CONFIRM_TEXT;
+		$defaultLabel = $this->_('Bundled default (site-blank)');
+		$noneLabel    = $this->_('None');
+
+		// Pre-compute transitive deps so JS can display them in the modal
+		$saved    = isset($data['keepModules']) ? (array) $data['keepModules'] : [];
+		$expanded = $this->expandKeepModules($saved);
+		$deps     = array_values(array_diff($expanded, $saved));
+		$depsJson = json_encode($deps);
+
+		$modal = $this->_('Confirm Installation Reset');
+		$warn  = $this->_('This will permanently delete all content, fields, templates, uploaded files, and non-kept modules. The superuser account is preserved. This cannot be undone!');
+		$exec  = $this->_('Execute Reset');
+		$cancel = $this->_('Cancel');
+		$lProfile = $this->_('Profile');
+		$lModules = $this->_('Modules to keep');
+		$lDeps    = $this->_('Auto-included dependencies');
+		$lDirs    = $this->_('Directories to keep');
+		$lChmod   = $this->_('Permissions');
+
+		return <<<HTML
+<div id="pwreset-modal" uk-modal="bg-close:false;esc-close:false;">
+	<div class="uk-modal-dialog" style="background:#fff;">
+		<button class="uk-modal-close-default" type="button" uk-close></button>
+		<div class="uk-modal-header"><h2 class="uk-modal-title">{$modal}</h2></div>
+		<div class="uk-modal-body">
+			<div class="uk-alert uk-alert-danger">{$warn}</div>
+			<table class="uk-table uk-table-divider uk-table-small uk-margin-top">
+				<tr><th style="width:180px">{$lProfile}</th><td id="pwr-sum-profile"></td></tr>
+				<tr><th>{$lModules}</th><td id="pwr-sum-modules"></td></tr>
+				<tr id="pwr-deps-row" style="display:none"><th>{$lDeps}</th><td id="pwr-sum-deps"></td></tr>
+				<tr><th>{$lDirs}</th><td id="pwr-sum-dirs"></td></tr>
+				<tr><th>{$lChmod}</th><td id="pwr-sum-chmod"></td></tr>
+			</table>
+		</div>
+		<div class="uk-modal-footer uk-text-right">
+			<button type="button" class="uk-button uk-button-secondary uk-modal-close">{$cancel}</button>
+			<button type="button" id="pwr-confirm-btn" class="uk-button uk-button-danger">
+				<i class="fa fa-refresh"></i> {$exec}
+			</button>
+		</div>
+	</div>
+</div>
+
+<input type="hidden" name="submit_reset"  id="pwr-hidden-submit"  value="" disabled>
+<input type="hidden" name="confirmReset"  id="pwr-hidden-confirm" value="" disabled>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+	var cb      = document.getElementById('pwreset-enable');
+	var btn     = document.getElementById('pwr-confirm-btn');
+	var hSubmit = document.getElementById('pwr-hidden-submit');
+	var hConfirm= document.getElementById('pwr-hidden-confirm');
+	var modal   = document.getElementById('pwreset-modal');
+	if(!cb || !btn || !modal) return;
+	var form = cb.closest('form');
+	if(!form) return;
+	var confirmed = false;
+	var deps = {$depsJson};
+
+	function listHtml(items) {
+		return '<ul class="uk-list uk-list-disc uk-margin-remove">'
+			+ items.map(function(i){ return '<li>'+i+'</li>'; }).join('') + '</ul>';
+	}
+
+	form.addEventListener('submit', function(e) {
+		if(!cb.checked || confirmed) return;
+		e.preventDefault();
+
+		// Profile
+		var pInput = form.querySelector('[name=profilePath]');
+		document.getElementById('pwr-sum-profile').textContent =
+			(pInput && pInput.value.trim()) ? pInput.value.trim() : '{$defaultLabel}';
+
+		// Modules
+		var mItems = [];
+		form.querySelectorAll('#wrap_keepModules .asmListItem .asmListItemLabel')
+			.forEach(function(el){ mItems.push(el.textContent.trim()); });
+		if(!mItems.length) {
+			var mSel = form.querySelector('[name="keepModules[]"]');
+			if(mSel) Array.from(mSel.options).filter(function(o){ return o.selected; })
+				.forEach(function(o){ mItems.push(o.text||o.value); });
+		}
+		var mEl = document.getElementById('pwr-sum-modules');
+		mEl.innerHTML = mItems.length ? listHtml(mItems) : '{$noneLabel}';
+
+		// Deps
+		var dRow = document.getElementById('pwr-deps-row');
+		if(deps.length) {
+			dRow.style.display = '';
+			document.getElementById('pwr-sum-deps').innerHTML = listHtml(deps);
+		} else {
+			dRow.style.display = 'none';
+		}
+
+		// Directories
+		var dInput = form.querySelector('[name=keepDirectories]');
+		var dLines = dInput ? dInput.value.split('\n').filter(function(l){
+			return l.trim() && l.trim()[0] !== '#';
+		}) : [];
+		document.getElementById('pwr-sum-dirs').innerHTML =
+			dLines.length ? listHtml(dLines.map(function(l){ return '<code>'+l.trim()+'</code>'; })) : '{$noneLabel}';
+
+		// Chmod
+		var cd = form.querySelector('[name=chmodDir]');
+		var cf = form.querySelector('[name=chmodFile]');
+		document.getElementById('pwr-sum-chmod').textContent =
+			'Dirs: ' + ((cd && cd.value.trim()) || (cd && cd.placeholder) || '0755') +
+			', Files: ' + ((cf && cf.value.trim()) || (cf && cf.placeholder) || '0644');
+
+		UIkit.modal(modal).show();
+	});
+
+	btn.addEventListener('click', function() {
+		confirmed = true;
+		hSubmit.value    = '1';   hSubmit.disabled   = false;
+		hConfirm.value   = '{$confirmText}'; hConfirm.disabled  = false;
+		UIkit.modal(modal).hide();
+		form.submit();
+	});
+});
+</script>
+HTML;
+	}
+
+	// =========================================================================
 	// Reset Execution
-	// =====================================================================
+	// =========================================================================
 
 	/**
-	 * Execute the full installation reset
+	 * Execute the full installation reset.
 	 *
-	 * Drops all tables, reimports from install.sql, restores the superuser,
-	 * cleans the filesystem, and writes the deferred-install pending file.
-	 * On success, sends a redirect header and exits the request.
+	 * Phase 0 — Pre-flight:  filesystem permission checks
+	 * Phase 1 — Backup:      superuser, module data, custom tables, SQL paths
+	 * Phase 2 — DB reset:    drop tables, import SQL, restore superuser + theme
+	 * Phase 3 — Filesystem:  clean assets, templates, modules dirs
+	 * Phase 4 — Redirect:    send Location header and exit
 	 *
-	 * @param array $data Current module config data
-	 * @throws WireException If the SQL import or DB reset phase fails
+	 * MySQL DDL (DROP/CREATE TABLE) causes implicit commits and cannot be rolled
+	 * back. Once Phase 2 starts, the DB is modified. On failure we throw so the
+	 * user sees a clear error; the pending files are cleaned up to prevent
+	 * partial-state module installs on the next request.
+	 *
+	 * @param  array $data Saved module config
+	 * @throws WireException on DB or fatal filesystem failure
 	 */
 	protected function executeReset(array $data) {
 		set_time_limit(300);
 
-		// Merge with defaults — saved config may be missing keys
-		$data = array_merge([
-			'profilePath' => '',
-			'keepModules' => [],
-			'keepDirectories' => '',
-			'chmodDir' => '',
-			'chmodFile' => '',
-		], $data);
-
 		$database = $this->wire('database');
-		$config = $this->wire('config');
-		$input = $this->wire('input');
+		$config   = $this->wire('config');
+		$input    = $this->wire('input');
 
-		// executeReset() only runs from a POST submission of our reset form,
-		// so POST values are authoritative — NOT the saved config. Using the
-		// saved config as fallback is wrong: the user may have just deselected
-		// modules in the AsmSelect without clicking the main Submit to persist,
-		// and the form could still legitimately mean "clean reset, keep nothing".
-		$data['profilePath'] = (string) ($input->post('profilePath') ?? '');
+		// POST values are authoritative for all reset settings.
+		// The user may have changed the form without clicking Save first.
+		$profilePath = (string) ($input->post('profilePath') ?? '');
 
-		$rawKeepModules = $input->post('keepModules');
-		if (is_array($rawKeepModules)) {
-			// AsmSelect posts as an array — filter out empty entries
-			$data['keepModules'] = array_values(array_filter(
-				array_map('strval', $rawKeepModules),
-				function($v) { return $v !== ''; }
-			));
-		} elseif (is_string($rawKeepModules) && $rawKeepModules !== '') {
-			$data['keepModules'] = array_values(array_filter(
-				array_map('trim', explode(',', $rawKeepModules))
-			));
+		$rawKeep = $input->post('keepModules');
+		if(is_array($rawKeep)) {
+			$keepModules = array_values(array_filter(array_map('strval', $rawKeep)));
+		} elseif(is_string($rawKeep) && $rawKeep !== '') {
+			$keepModules = array_values(array_filter(array_map('trim', explode(',', $rawKeep))));
 		} else {
-			// null, empty string, or unexpected type → nothing selected
-			$data['keepModules'] = [];
+			$keepModules = [];
 		}
 
-		// Read keepDirectories from POST (textarea, one path per line)
-		$rawKeepDirs = $input->post('keepDirectories');
-		$data['keepDirectories'] = ($rawKeepDirs !== null) ? (string) $rawKeepDirs : '';
+		$keepDirectories = (string) ($input->post('keepDirectories') ?? '');
+		$chmodDir  = (string) ($input->post('chmodDir')  ?? '');
+		$chmodFile = (string) ($input->post('chmodFile') ?? '');
 
-		// Read chmod fields from POST
-		$rawChmodDir = $input->post('chmodDir');
-		$data['chmodDir'] = ($rawChmodDir !== null) ? (string) $rawChmodDir : '';
-		$rawChmodFile = $input->post('chmodFile');
-		$data['chmodFile'] = ($rawChmodFile !== null) ? (string) $rawChmodFile : '';
+		// Expand keepModules to include transitive site-module dependencies
+		$keepModules = $this->expandKeepModules($keepModules);
 
-		// Automatically include all transitive site-module dependencies so
-		// preserving Module A also preserves the modules it requires.
-		$data['keepModules'] = $this->expandKeepModules((array) $data['keepModules']);
-
-		// Persist current config to DB BEFORE backup. When the user clicks
-		// "Reset Installation" without first clicking the main Submit button,
-		// PW's config save flow never runs (executeReset exits before it).
-		// Without this, backupModuleData reads the OLD saved config and the
-		// module's settings are lost after the reset.
+		// Persist current settings to DB before backup so that backupModuleData
+		// captures the values the user just submitted (they may not have clicked
+		// the main Save button before triggering the reset).
 		try {
-			$selfConfig = json_encode([
-				'profilePath' => $data['profilePath'],
-				'keepModules' => $data['keepModules'],
-				'keepDirectories' => $data['keepDirectories'],
-				'chmodDir' => $data['chmodDir'],
-				'chmodFile' => $data['chmodFile'],
+			$database->prepare("UPDATE modules SET data = :data WHERE class = :class")->execute([
+				':data'  => json_encode(compact('profilePath', 'keepModules', 'keepDirectories', 'chmodDir', 'chmodFile')),
+				':class' => $this->className(),
 			]);
-			$database->prepare("UPDATE modules SET data = :data WHERE class = :class")
-				->execute([':data' => $selfConfig, ':class' => $this->className()]);
-		} catch (\PDOException $e) {
-			// Non-fatal — worst case the settings reset to defaults
+		} catch(\PDOException $e) { /* non-fatal */ }
+
+		// ── Phase 0: Pre-flight ───────────────────────────────────────────────
+		$errors = $this->preflightCheck();
+		if(!empty($errors)) {
+			foreach($errors as $e) $this->error("Pre-flight: $e");
+			throw new WireException('Reset aborted (filesystem check failed): ' . implode('; ', $errors));
 		}
 
-		// ── Phase 0: Pre-flight checks ───────────────────────────────────
-		//
-		// Verify we can actually write to and delete from every critical
-		// directory BEFORE touching the database. If any check fails, abort
-		// cleanly — nothing has been modified yet.
-		$preflightErrors = $this->preflightCheck();
-		if (!empty($preflightErrors)) {
-			foreach ($preflightErrors as $err) {
-				$this->error("Pre-flight check failed: $err");
-			}
-			throw new WireException(
-				'Reset aborted: filesystem permission check failed. Cannot proceed. Issues: '
-				. implode('; ', $preflightErrors)
-			);
-		}
-
-		// ── Phase 1: Gather data before destroying anything ──────────────
-
+		// ── Phase 1: Backup ───────────────────────────────────────────────────
 		$superuser = $this->backupSuperuser($database, $config);
-		if (!$superuser) {
-			$this->error($this->_('Could not backup superuser data. Reset aborted.'));
-			return;
-		}
+		if(!$superuser) throw new WireException('Could not backup superuser — reset aborted.');
 
-		$coreInstallSql = $config->paths->wire . 'core/install.sql';
-		$profileInstallSql = $this->resolveProfileInstallSql($data);
+		$coreSQL    = $config->paths->wire . 'core/install.sql';
+		$profileSQL = $this->resolveProfileInstallSql(['profilePath' => $profilePath]);
 
-		if (!is_file($coreInstallSql)) {
-			$this->error($this->_('Core install.sql not found. Reset aborted.'));
-			return;
-		}
-		if (!$profileInstallSql || !is_file($profileInstallSql)) {
-			$this->error($this->_('Profile install.sql not found. Reset aborted.'));
-			return;
-		}
+		if(!is_file($coreSQL))    throw new WireException("Core install.sql not found: $coreSQL");
+		if(!$profileSQL || !is_file($profileSQL)) throw new WireException("Profile install.sql not found.");
 
-		$keepModuleDirs = $this->resolveKeepModuleDirs($data);
-		$profileTemplatesPath = $this->resolveProfileTemplatesPath($data);
+		$keepModuleDirs      = $this->resolveKeepModuleDirs(['keepModules' => $keepModules]);
+		$profileTemplatesPath = $this->resolveProfileTemplatesPath(['profilePath' => $profilePath]);
 
-		// Compute the topologically sorted install order including ALL
-		// transitive dependencies (site + core modules). Used to explicitly
-		// install each module after the reset instead of relying on PW's
-		// nested auto-install from within install().
-		$installOrder = $this->resolveInstallOrder((array) $data['keepModules']);
+		// Topologically sorted install order (site + core deps)
+		$installOrder = $this->resolveInstallOrder($keepModules);
 
-		// Back up DB config/flags for every module in the install order
-		// (plus self). This captures user-set configuration for core-module
-		// dependencies too — e.g. CKEditor plugins, SessionHandlerDB settings.
+		// Backup DB entries — always includes self + AdminThemeUikit
 		$keptModuleData = $this->backupModuleData($database, $installOrder);
 
-		// Back up custom tables (any table not defined in install.sql) —
-		// these typically belong to modules that create their own storage
-		// (e.g. login throttle, logs, custom module caches).
+		// Backup non-canonical tables (module storage, logs, etc.)
 		$customTables = [];
-		if (!empty($data['keepModules'])) {
-			$canonicalTables = $this->getCanonicalTables($coreInstallSql, $profileInstallSql);
-			$customTables = $this->backupCustomTables($database, $canonicalTables);
+		if(!empty($keepModules)) {
+			$canonicalTables = $this->getCanonicalTables($coreSQL, $profileSQL);
+			$customTables    = $this->backupCustomTables($database, $canonicalTables);
 		}
 
-		// ── Phase 2: Database reset via PW installer code ─────────────────
-		//
-		// Uses InstallerCore — a headless adaptation of ProcessWire's own
-		// install.php — to import the SQL and create the admin account. The
-		// installer's wizard UI is gone; its "form variables" come from the
-		// current installation's state instead:
-		//
-		//   profileImportSQL()   ← core + profile install.sql
-		//   adminAccountSave()   ← username/email/admin_name from the backed-up
-		//                          superuser; password hash+salt are restored
-		//                          via $passOverride so the existing login keeps
-		//                          working (we don't have plain-text pass).
-		//
-		// Note: MySQL/MariaDB DDL statements (DROP TABLE, CREATE TABLE) cause
-		// implicit commits and cannot be rolled back, so wrapping this phase
-		// in a transaction would be misleading. Instead, we use try/catch to
-		// surface errors clearly and clean up any partial state on failure.
+		// ── Phase 2: DB reset ─────────────────────────────────────────────────
 		try {
-			// Detect the ACTUAL charset from an existing PW table BEFORE
-			// dropping. Neither $config->dbCharset nor @@character_set_database
-			// are reliable — the config may say utf8mb4, the database default
-			// may be utf8mb4, but the actual tables use utf8mb3.
 			$tableCharset = $this->detectTableCharset($database, $config);
 
-			// Drop every existing table — profileImportSQL's CREATE statements
-			// only handle the canonical tables from install.sql; custom tables
-			// from modules would otherwise survive and collide with fresh
-			// module installs on the next request.
 			$this->dropAllTables($database);
 
-			// Instantiate the headless installer and populate its "form vars"
-			// from the current installation's state. chmod values are kept as
-			// the octal-digit strings the PW installer expects (it calls
-			// octdec() internally); leading zeros are stripped so empty config
-			// falls back to the PW config defaults.
-			$chmodDirStr = (string) ($data['chmodDir'] ?: $config->chmodDir ?: '0755');
-			$chmodFileStr = (string) ($data['chmodFile'] ?: $config->chmodFile ?: '0644');
+			// Instantiate headless installer and configure charset/engine
 			$installer = new InstallerCore();
-			$installer->chmodDir = ltrim($chmodDirStr, '0') ?: '755';
-			$installer->chmodFile = ltrim($chmodFileStr, '0') ?: '644';
-			$installer->dbEngine = $config->dbEngine ?: 'InnoDB';
+			$installer->chmodDir  = ltrim((string) ($chmodDir  ?: $config->chmodDir  ?: '0755'), '0') ?: '755';
+			$installer->chmodFile = ltrim((string) ($chmodFile ?: $config->chmodFile ?: '0644'), '0') ?: '644';
+			$installer->dbEngine  = $config->dbEngine ?: 'InnoDB';
 			$installer->dbCharset = $tableCharset;
 
-			// Step 1: import SQL (same as PW installer's profileImport step).
-			$installer->profileImportSQL(
-				$database,
-				$coreInstallSql,
-				$profileInstallSql,
-				[
-					'dbEngine' => $installer->dbEngine,
-					'dbCharset' => $installer->dbCharset,
-				]
-			);
+			// 2a. Import SQL (core + profile) using PW's own WireDatabaseBackup
+			$installer->profileImportSQL($database, $coreSQL, $profileSQL, [
+				'dbEngine'  => $installer->dbEngine,
+				'dbCharset' => $installer->dbCharset,
+			]);
 
-			// Preserve the original field_pass / field_email column sizes.
-			// SystemUpdater and third-party modules sometimes widen these
-			// columns over time (e.g. to hold longer Argon2/bcrypt hashes);
-			// re-importing install.sql resets them to the bundled defaults.
-			// Drop + recreate with the captured schemas so the upcoming
-			// password-hash restore won't truncate.
-			if (!empty($superuser['pass_schema'])) {
+			if($installer->numErrors) {
+				throw new WireException('SQL import errors: ' . implode('; ', $installer->errors));
+			}
+
+			// 2b. Restore field_pass / field_email with original column schemas.
+			// Re-importing install.sql resets column widths to bundled defaults;
+			// modern PW hashes (Argon2/bcrypt) may need wider columns.
+			if(!empty($superuser['pass_schema'])) {
 				$database->exec("DROP TABLE IF EXISTS `field_pass`");
 				$database->exec($superuser['pass_schema']);
-				// Guest user (pages_id=40) row that core install.sql seeded —
-				// re-insert so PW's login logic doesn't choke on missing row.
+				// Seed guest user row (pages_id=40) that core install.sql provides
 				$database->exec("INSERT INTO field_pass (pages_id, data, salt) VALUES (40, '', '')");
 			}
-			if (!empty($superuser['email_schema'])) {
+			if(!empty($superuser['email_schema'])) {
 				$database->exec("DROP TABLE IF EXISTS `field_email`");
 				$database->exec($superuser['email_schema']);
 			}
 
-			// Step 2: restore superuser account via direct DB operations.
-			//
-			// We do NOT use the installer's adminAccountSave() here. That method
-			// was designed for a fresh ProcessWire bootstrap — a new $wire
-			// instance with empty caches. Inside a live request the in-memory
-			// caches for Users, Pages, Modules are stale relative to the just-
-			// imported DB, and the API-level save triggers hooks and field
-			// handlers that interact with those stale caches in unpredictable
-			// ways (empty email, admin_theme not persisted, etc.).
-			//
-			// Instead we mirror exactly what adminAccountSave() writes to the
-			// DB, but do it directly — no API, no cache, no surprises.
+			// 2c. Superuser page name
+			$database->prepare("UPDATE pages SET name = :name WHERE id = :id")
+				->execute([':name' => $superuser['name'], ':id' => (int) $superuser['id']]);
 
-			// 2a. Superuser page name
-			$stmt = $database->prepare("UPDATE pages SET name = :name WHERE id = :id");
-			$stmt->execute([':name' => $superuser['name'], ':id' => (int) $superuser['id']]);
+			// 2d. Admin root page name (preserves custom admin URL slug)
+			$database->prepare("UPDATE pages SET name = :name WHERE id = :id")
+				->execute([
+					':name' => $superuser['admin_name'] ?: 'processwire',
+					':id'   => (int) $config->adminRootPageID,
+				]);
 
-			// 2b. Admin root page name (preserves custom admin URL slug)
-			$stmt = $database->prepare("UPDATE pages SET name = :name WHERE id = :id");
-			$stmt->execute([
-				':name' => $superuser['admin_name'] ?: 'processwire',
-				':id' => (int) $config->adminRootPageID,
-			]);
-
-			// 2c. Password — install.sql seeds an empty row for pages_id=41;
-			//     UPDATE it with the backed-up hash+salt.
+			// 2e. Password hash + salt
 			if(!empty($superuser['pass_data'])) {
-				$stmt = $database->prepare(
+				$database->prepare(
 					"INSERT INTO field_pass (pages_id, data, salt)
 					 VALUES (:id, :data, :salt)
 					 ON DUPLICATE KEY UPDATE data = VALUES(data), salt = VALUES(salt)"
-				);
-				$stmt->execute([
-					':id' => (int) $superuser['id'],
+				)->execute([
+					':id'   => (int) $superuser['id'],
 					':data' => $superuser['pass_data'],
 					':salt' => $superuser['pass_salt'],
 				]);
 			}
 
-			// 2d. Email — install.sql may not seed a row for the superuser;
-			//     use UPSERT so it works whether the row exists or not.
+			// 2f. Email
 			if(!empty($superuser['email'])) {
-				$stmt = $database->prepare(
+				$database->prepare(
 					"INSERT INTO field_email (pages_id, data)
 					 VALUES (:id, :data)
 					 ON DUPLICATE KEY UPDATE data = VALUES(data)"
-				);
-				$stmt->execute([
-					':id' => (int) $superuser['id'],
-					':data' => $superuser['email'],
-				]);
+				)->execute([':id' => (int) $superuser['id'], ':data' => $superuser['email']]);
 			}
 
-			// 2e–2f: best-effort restores — these enhance the result but must
-			// NOT abort the reset if they fail (e.g. table missing, old DB
-			// without JSON functions). Wrap each in its own try/catch so a
-			// failure here never blocks writePendingInstalls below.
-
-			// 2e. Admin theme preference
+			// 2g. Admin theme per-user preference (best-effort — table may not exist yet)
 			try {
-				$adminThemeVal = !empty($superuser['admin_theme'])
-					? $superuser['admin_theme']
-					: 'AdminThemeUikit';
-				$stmt = $database->prepare(
+				$database->prepare(
 					"INSERT INTO field_admin_theme (pages_id, data)
 					 VALUES (:id, :data)
 					 ON DUPLICATE KEY UPDATE data = VALUES(data)"
-				);
-				$stmt->execute([':id' => (int) $superuser['id'], ':data' => $adminThemeVal]);
-			} catch (\Exception $e) {
-				$this->wire('log')->save('processwirereset', 'admin_theme restore skipped: ' . $e->getMessage());
+				)->execute([
+					':id'   => (int) $superuser['id'],
+					':data' => $superuser['admin_theme'] ?: 'AdminThemeUikit',
+				]);
+			} catch(\Exception $e) {
+				$this->wire('log')->save('processwirereset', 'admin_theme skipped: ' . $e->getMessage());
 			}
 
-			// 2f. AdminThemeUikit: ensure it exists in the modules table and
-			//     has useAsLogin=1 so the login screen uses it.
-			//
-			// The profile install.sql only seeds AdminThemeDefault (not Uikit),
-			// so AdminThemeUikit is typically absent from the fresh modules table.
-			// An UPDATE-only approach would silently do nothing. We therefore
-			// check first and UPSERT: UPDATE if the row is present (e.g. the
-			// site's profile already includes it), INSERT if it is missing.
-			//
-			// Flags/data for the INSERT come from the pre-reset backup stored in
-			// $keptModuleData (backupModuleData always includes AdminThemeUikit).
-			// Fall back to flags=2 (FLAG_SINGULAR, same as AdminThemeDefault) if
-			// no backup was found (fresh install where Uikit wasn't registered).
+			// 2h. AdminThemeUikit — register with useAsLogin=1.
+			// The profile install.sql only seeds AdminThemeDefault, so Uikit is
+			// not in the fresh modules table. INSERT if missing, UPDATE if present.
 			try {
 				$stmt = $database->prepare("SELECT data, flags FROM modules WHERE class = 'AdminThemeUikit'");
 				$stmt->execute();
 				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
 
-				if ($row !== false) {
-					// Row exists — merge useAsLogin=1 into current data
-					$modData = ($row['data'] !== '' && $row['data'] !== null)
-						? json_decode($row['data'], true) : [];
-					if (!is_array($modData)) $modData = [];
-					$modData['useAsLogin'] = 1;
-					$stmt = $database->prepare("UPDATE modules SET data = :data WHERE class = 'AdminThemeUikit'");
-					$stmt->execute([':data' => json_encode($modData)]);
+				if($row !== false) {
+					$d = ($row['data'] !== '' && $row['data'] !== null) ? json_decode($row['data'], true) : [];
+					if(!is_array($d)) $d = [];
+					$d['useAsLogin'] = 1;
+					$database->prepare("UPDATE modules SET data = :data WHERE class = 'AdminThemeUikit'")
+						->execute([':data' => json_encode($d)]);
 				} else {
-					// Not in table yet — INSERT with backed-up data + useAsLogin=1
-					$uikitBackup = isset($keptModuleData['AdminThemeUikit']) ? $keptModuleData['AdminThemeUikit'] : null;
-					$uikitFlags  = $uikitBackup ? (int) $uikitBackup['flags'] : 2;
-					$baseData    = ($uikitBackup && $uikitBackup['data'] !== '')
-						? json_decode($uikitBackup['data'], true) : [];
-					if (!is_array($baseData)) $baseData = [];
-					$baseData['useAsLogin'] = 1;
-					$stmt = $database->prepare(
+					$backup = $keptModuleData['AdminThemeUikit'] ?? null;
+					$flags  = $backup ? (int) $backup['flags'] : 2;
+					$d      = ($backup && $backup['data'] !== '') ? json_decode($backup['data'], true) : [];
+					if(!is_array($d)) $d = [];
+					$d['useAsLogin'] = 1;
+					$database->prepare(
 						"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
-					);
-					$stmt->execute([
-						':class' => 'AdminThemeUikit',
-						':flags' => $uikitFlags,
-						':data'  => json_encode($baseData),
-					]);
+					)->execute([':class' => 'AdminThemeUikit', ':flags' => $flags, ':data' => json_encode($d)]);
 				}
-			} catch (\Exception $e) {
-				$this->wire('log')->save('processwirereset', 'useAsLogin restore skipped: ' . $e->getMessage());
+			} catch(\Exception $e) {
+				$this->wire('log')->save('processwirereset', 'useAsLogin skipped: ' . $e->getMessage());
 			}
 
-			// Only re-register ProcessWireReset itself directly so PW can autoload
-			// it on the next request. Other kept modules are deferred — their
-			// install() is called in processPendingInstalls() on the next request,
-			// so admin pages, custom fields, DB tables etc. are recreated.
+			// 2i. Re-register ProcessWireReset in the fresh modules table
 			$this->restoreSelfModule($database, $keptModuleData);
-			// Custom tables are NOT restored here. If we recreated them now,
-			// the next request's processPendingInstalls() would call each
-			// module's install() which in turn tries to CREATE TABLE for its
-			// own custom tables — and those CREATEs would fail because the
-			// tables already exist. Instead we defer the restore: serialize
-			// the backup to a pending file, and restoreCustomTables() runs
-			// in processPendingInstalls() AFTER all module installs have
-			// created their (empty) fresh tables.
+
+			// 2j. Write deferred-task files for the next request
 			$this->writePendingCustomTables($customTables);
 			$this->writePendingInstalls($keptModuleData, $installOrder);
-		} catch (\Exception $e) {
-			// Remove any half-written pending files so the next request doesn't
-			// try to install modules into an inconsistent DB state.
-			$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
-			if (file_exists($pendingFile)) unlink($pendingFile);
-			$pendingTablesFile = __DIR__ . '/' . self::PENDING_TABLES_FILE;
-			if (file_exists($pendingTablesFile)) unlink($pendingTablesFile);
 
-			$this->wire('log')->error('ProcessWireReset: DB reset phase failed: ' . $e->getMessage());
-			throw new WireException(
-				'Database reset failed: ' . $e->getMessage() .
-				' — installation may be in an inconsistent state. Use repair.php to recover.',
-				0,
-				$e
-			);
+		} catch(\Exception $e) {
+			// Clean up half-written pending files so the next request doesn't
+			// try to install modules into an inconsistent DB state.
+			foreach([self::PENDING_FILE, self::PENDING_TABLES_FILE] as $f) {
+				$p = __DIR__ . '/' . $f;
+				if(file_exists($p)) @unlink($p);
+			}
+			$this->wire('log')->error('ProcessWireReset DB phase failed: ' . $e->getMessage());
+			throw new WireException('Database reset failed: ' . $e->getMessage() .
+				' — installation may be inconsistent.', 0, $e);
 		}
 
-		// ── Phase 3: Filesystem reset ────────────────────────────────────
-
-		// Disable autoloaded debug tools and suppress errors from their
-		// shutdown handlers — module files are about to be deleted.
+		// ── Phase 3: Filesystem ───────────────────────────────────────────────
 		$this->silenceAutoloadModules();
 
-		$sitePath = $config->paths->site;
-
-		// Reset failure counter — tracks files/dirs that could not be deleted.
-		// Any non-zero count after the phase triggers an exception in the
-		// redirect step so the user sees a clear failure message.
+		$sitePath   = $config->paths->site;
 		$this->fsFailures = [];
+		$keepDirPaths     = $this->parseKeepDirectories($keepDirectories, $sitePath);
 
-		// Parse the keepDirectories textarea into a set of absolute paths
-		// that the cleanup helpers will skip.
-		$keepDirPaths = $this->parseKeepDirectories($data['keepDirectories'], $sitePath);
-
-		// Clean site/assets/ — empties the four standard dirs (files, cache,
-		// logs, sessions) and removes any other entries that modules may
-		// have created (e.g. assets/TracyDebugger/, assets/backups/,
-		// assets/FormBuilder/). Keeps installed.php, index.php, and any
-		// paths listed in keepDirectories.
 		$this->cleanAssetsDirectory($sitePath . 'assets/', $keepDirPaths);
 
-		// Reset templates to profile state — preserving any keepDirectories
-		// entries that live under templates/
 		$this->emptyDirectory($sitePath . 'templates/', $keepDirPaths);
-		if ($profileTemplatesPath && is_dir($profileTemplatesPath)) {
+		if($profileTemplatesPath && is_dir($profileTemplatesPath)) {
 			$this->copyDirectoryRecursive($profileTemplatesPath, $sitePath . 'templates/');
 		}
 
-		// Clean site/modules/ — keep only self + selected
 		$this->cleanModulesDirectory($sitePath . 'modules/', $keepModuleDirs);
 
-		// Ensure installed.php exists (prevents PW installer from running)
-		if (file_put_contents(
+		if(file_put_contents(
 			$sitePath . 'assets/installed.php',
 			"<?php // The existence of this file prevents the installer from running."
 		) === false) {
-			$this->fsFailures[] = $sitePath . 'assets/installed.php (could not write)';
+			$this->fsFailures[] = $sitePath . 'assets/installed.php (write failed)';
 		}
 
-		// Log any filesystem failures but do NOT throw — the DB reset has
-		// already completed and there is no way to roll it back. Throwing
-		// here would block the redirect and leave the user stuck on an
-		// error page with a half-cleaned installation. Instead, log the
-		// details and continue to the login page. The user can check the
-		// log and manually remove leftover files.
-		if (!empty($this->fsFailures)) {
+		if(!empty($this->fsFailures)) {
 			$count = count($this->fsFailures);
 			$this->wire('log')->save('processwirereset',
-				"Filesystem cleanup: $count operation(s) failed. "
-				. "These files/directories could not be removed (permission issues). "
-				. "First 20:\n- " . implode("\n- ", array_slice($this->fsFailures, 0, 20))
+				"Filesystem cleanup: $count failure(s):\n- " . implode("\n- ", array_slice($this->fsFailures, 0, 20))
 			);
 		}
 
-		// ── Phase 4: Redirect to login ───────────────────────────────────
-
+		// ── Phase 4: Redirect ─────────────────────────────────────────────────
 		$adminUrl = $this->safeRedirectUrl($config->urls->admin);
-
-		// Send redirect and close connection before shutdown handlers fire
 		header("Location: $adminUrl");
 		header("Connection: close");
 		header("Content-Length: 0");
-		if (function_exists('fastcgi_finish_request')) {
+		if(function_exists('fastcgi_finish_request')) {
 			fastcgi_finish_request();
 		} else {
-			while (ob_get_level() > 0) ob_end_clean();
+			while(ob_get_level() > 0) ob_end_clean();
 			flush();
 		}
 		exit;
 	}
 
-	// =====================================================================
-	// Database Helpers
-	// =====================================================================
+	// =========================================================================
+	// Backup helpers
+	// =========================================================================
 
 	/**
-	 * Backup the current superuser's credentials
+	 * Capture the current superuser's credentials and field schemas before reset.
 	 *
-	 * @param WireDatabasePDO $database
-	 * @param Config $config
-	 * @return array|null
+	 * @return array|null Keys: id, name, admin_name, pass_data, pass_salt,
+	 *                    email, admin_theme, pass_schema, email_schema
 	 */
 	protected function backupSuperuser($database, $config) {
-		$userId = (int) $config->superUserPageID;
+		$userId  = (int) $config->superUserPageID;
 		$adminId = (int) $config->adminRootPageID;
-
 		try {
 			$stmt = $database->prepare("SELECT id, name FROM pages WHERE id = :id");
 			$stmt->execute([':id' => $userId]);
 			$page = $stmt->fetch(\PDO::FETCH_ASSOC);
-			if (!$page) return null;
+			if(!$page) return null;
 
-			// Admin root page name (the URL slug — e.g. "processwire", "admin").
-			// Preserved across the reset so bookmarked admin URLs keep working.
 			$stmt = $database->prepare("SELECT name FROM pages WHERE id = :id");
 			$stmt->execute([':id' => $adminId]);
-			$adminRow = $stmt->fetch(\PDO::FETCH_ASSOC);
+			$adminRow  = $stmt->fetch(\PDO::FETCH_ASSOC);
 			$adminName = $adminRow ? $adminRow['name'] : 'processwire';
 
 			$stmt = $database->prepare("SELECT data, salt FROM field_pass WHERE pages_id = :id");
@@ -1076,1145 +836,710 @@ HTMLMODAL;
 			$stmt->execute([':id' => $userId]);
 			$email = $stmt->fetch(\PDO::FETCH_ASSOC);
 
-			// Capture current schemas for field_pass and field_email to
-			// preserve any column size upgrades applied by SystemUpdater
-			// or third-party modules (modern PW hashes can exceed char(40))
-			$passSchema = $this->getCreateTable($database, 'field_pass');
-			$emailSchema = $this->getCreateTable($database, 'field_email');
-
-			// Admin theme preference (stored in field_admin_theme per user)
 			$adminTheme = '';
 			try {
 				$stmt = $database->prepare("SELECT data FROM field_admin_theme WHERE pages_id = :id");
 				$stmt->execute([':id' => $userId]);
-				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
-				$adminTheme = $row ? $row['data'] : '';
-			} catch (\PDOException $e) {
-				// field_admin_theme may not exist yet — silently ignore
-			}
+				$r = $stmt->fetch(\PDO::FETCH_ASSOC);
+				$adminTheme = $r ? $r['data'] : '';
+			} catch(\PDOException $e) { /* field_admin_theme may not exist */ }
 
 			return [
-				'id' => $userId,
-				'name' => $page['name'],
-				'admin_name' => $adminName,
-				'pass_data' => $pass ? rtrim($pass['data']) : '',
-				'pass_salt' => $pass ? rtrim($pass['salt']) : '',
-				'email' => $email ? $email['data'] : '',
+				'id'          => $userId,
+				'name'        => $page['name'],
+				'admin_name'  => $adminName,
+				'pass_data'   => $pass  ? rtrim($pass['data']) : '',
+				'pass_salt'   => $pass  ? rtrim($pass['salt']) : '',
+				'email'       => $email ? $email['data']       : '',
 				'admin_theme' => $adminTheme,
-				'pass_schema' => $passSchema,
-				'email_schema' => $emailSchema,
+				'pass_schema' => $this->getCreateTable($database, 'field_pass'),
+				'email_schema'=> $this->getCreateTable($database, 'field_email'),
 			];
-		} catch (\PDOException $e) {
+		} catch(\PDOException $e) {
 			return null;
 		}
 	}
 
 	/**
-	 * Backup module DB entries (class, flags, data) for given module names
+	 * Backup modules table entries for the given class names.
 	 *
-	 * Backs up the modules.data column for every module in the install list
-	 * (including self). Modules not currently in the modules table (e.g. core
-	 * modules that get installed as dependencies later) are skipped — they'll
-	 * be installed fresh with default config.
+	 * Always includes self and AdminThemeUikit regardless of $moduleNames so
+	 * that (a) the module's own settings survive the reset and (b) the
+	 * useAsLogin restore in Phase 2h has the correct flags/data to work with.
 	 *
-	 * @param WireDatabasePDO $database
-	 * @param array $moduleNames List of module class names to back up
-	 * @return array Map of className => ['class' => ..., 'flags' => ..., 'data' => ...]
+	 * @param  WireDatabasePDO $database
+	 * @param  string[]        $moduleNames
+	 * @return array  className => [class, flags, data]
 	 */
 	protected function backupModuleData($database, array $moduleNames) {
-		// Always include AdminThemeUikit so its flags/data are available for
-		// the useAsLogin restore in executeReset() phase 2f, regardless of
-		// whether the user listed it in keepModules.
 		$moduleNames = array_unique(array_merge([$this->className(), 'AdminThemeUikit'], $moduleNames));
-		$result = [];
-
-		foreach ($moduleNames as $className) {
+		$result      = [];
+		foreach($moduleNames as $className) {
 			try {
 				$stmt = $database->prepare("SELECT class, flags, data FROM modules WHERE class = :class");
 				$stmt->execute([':class' => $className]);
 				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
-				// Only back up modules that are actually installed. Unknown
-				// modules (e.g. core deps added by resolveInstallOrder but
-				// not yet installed) are skipped and will use defaults.
-				if ($row) $result[$className] = $row;
-			} catch (\PDOException $e) {
-				// Ignore errors — module not in DB means no config to back up
-			}
+				if($row) $result[$className] = $row;
+			} catch(\PDOException $e) { /* ignore — module not yet installed */ }
 		}
-
 		return $result;
 	}
 
 	/**
-	 * Get the CREATE TABLE statement for a given table
+	 * Backup non-canonical tables (those not defined in the install.sql files).
 	 *
-	 * @param WireDatabasePDO $database
-	 * @param string $table Table name (must be validated)
-	 * @return string CREATE TABLE statement or empty string on failure
+	 * For field_* tables: only backs up tables whose field is registered in the
+	 * `fields` table. Orphaned field tables (from improperly uninstalled modules)
+	 * are skipped.
+	 *
+	 * @param  WireDatabasePDO $database
+	 * @param  array           $canonicalTables table_name => true
+	 * @return array           table => ['create' => sql, 'rows' => [...]]
 	 */
+	protected function backupCustomTables($database, array $canonicalTables) {
+		$backup     = [];
+		$allTables  = $database->query("SHOW TABLES")->fetchAll(\PDO::FETCH_COLUMN);
+
+		$registeredFields = [];
+		try {
+			$stmt = $database->query("SELECT name FROM fields");
+			while($name = $stmt->fetchColumn()) {
+				$registeredFields['field_' . $name] = true;
+			}
+		} catch(\PDOException $e) { /* fall through — back up everything */ }
+
+		foreach($allTables as $table) {
+			if(isset($canonicalTables[$table])) continue;
+			if(strpos($table, 'field_') === 0 && !empty($registeredFields)) {
+				if(!isset($registeredFields[$table])) continue;
+			}
+			$create = $this->getCreateTable($database, $table);
+			if(empty($create)) continue;
+
+			$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
+			try {
+				$rows = $database->query("SELECT * FROM `$safe`")->fetchAll(\PDO::FETCH_ASSOC);
+			} catch(\PDOException $e) { continue; }
+
+			$backup[$safe] = ['create' => $create, 'rows' => $rows];
+		}
+		return $backup;
+	}
+
+	// =========================================================================
+	// DB helpers
+	// =========================================================================
+
+	/**
+	 * Detect the actual charset used by existing PW tables.
+	 * Reads from information_schema — more reliable than $config->dbCharset.
+	 */
+	protected function detectTableCharset($database, $config) {
+		try {
+			$stmt = $database->prepare(
+				"SELECT TABLE_COLLATION FROM information_schema.TABLES
+				 WHERE TABLE_SCHEMA = :db AND TABLE_NAME = 'caches' LIMIT 1"
+			);
+			$stmt->execute([':db' => $config->dbName]);
+			$collation = $stmt->fetchColumn();
+			if($collation) {
+				return explode('_', $collation, 2)[0]; // e.g. utf8mb3_general_ci → utf8mb3
+			}
+		} catch(\PDOException $e) { /* fall through */ }
+		return $config->dbCharset ?: 'utf8';
+	}
+
+	/**
+	 * Drop every table (and view) in the current database.
+	 * Multi-pass to handle FK constraints. Throws if any tables remain.
+	 *
+	 * @throws WireException
+	 */
+	protected function dropAllTables($database) {
+		$dbName = $this->wire('config')->dbName;
+		$database->exec("SET FOREIGN_KEY_CHECKS = 0");
+
+		for($pass = 0; $pass < 5; $pass++) {
+			$stmt = $database->prepare(
+				"SELECT TABLE_NAME FROM information_schema.TABLES
+				 WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE'"
+			);
+			$stmt->execute([':db' => $dbName]);
+			$tables = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+			if(empty($tables)) break;
+			foreach($tables as $t) {
+				$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $t);
+				if($safe !== '') {
+					try { $database->exec("DROP TABLE IF EXISTS `$safe`"); }
+					catch(\PDOException $e) { /* retry next pass */ }
+				}
+			}
+		}
+
+		// Drop views
+		try {
+			$stmt = $database->prepare(
+				"SELECT TABLE_NAME FROM information_schema.TABLES
+				 WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'VIEW'"
+			);
+			$stmt->execute([':db' => $dbName]);
+			foreach($stmt->fetchAll(\PDO::FETCH_COLUMN) as $v) {
+				$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $v);
+				if($safe !== '') $database->exec("DROP VIEW IF EXISTS `$safe`");
+			}
+		} catch(\PDOException $e) { /* views are optional */ }
+
+		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
+
+		$stmt = $database->prepare(
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = :db"
+		);
+		$stmt->execute([':db' => $dbName]);
+		$remaining = (int) $stmt->fetchColumn();
+		if($remaining > 0) {
+			throw new WireException("dropAllTables: $remaining table(s) remain in '$dbName'");
+		}
+	}
+
+	/** Return the CREATE TABLE statement for $table, or '' on failure. */
 	protected function getCreateTable($database, $table) {
 		$table = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
 		try {
 			$row = $database->query("SHOW CREATE TABLE `$table`")->fetch(\PDO::FETCH_NUM);
 			return $row ? $row[1] : '';
-		} catch (\PDOException $e) {
-			return '';
-		}
+		} catch(\PDOException $e) { return ''; }
 	}
 
 	/**
-	 * Parse install.sql files and return all CREATE TABLE names
-	 *
-	 * These are the "canonical" tables that restoreMerge will recreate.
-	 * Any table in the live DB that is NOT in this list is considered
-	 * custom (typically belonging to modules that create their own tables).
-	 *
-	 * @param string ...$files One or more SQL file paths
-	 * @return array Map of table_name => true
+	 * Parse all CREATE TABLE names from one or more SQL files.
+	 * Returns a map of table_name => true (the "canonical" set after import).
 	 */
-	protected function getCanonicalTables(...$files) {
+	protected function getCanonicalTables(string ...$files) {
 		$tables = [];
-		foreach ($files as $file) {
-			if (!is_file($file) || !is_readable($file)) continue;
+		foreach($files as $file) {
+			if(!is_file($file) || !is_readable($file)) continue;
 			$content = file_get_contents($file);
-			if ($content === false) continue;
-			if (preg_match_all('/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i', $content, $matches)) {
-				foreach ($matches[1] as $tableName) {
-					$tables[$tableName] = true;
-				}
+			if($content === false) continue;
+			if(preg_match_all('/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i', $content, $m)) {
+				foreach($m[1] as $name) $tables[$name] = true;
 			}
 		}
 		return $tables;
 	}
 
 	/**
-	 * Back up non-canonical tables that are still legitimate
+	 * Restore backed-up custom tables after all module install() calls have run.
+	 * Drops the fresh (empty) version and recreates it from the backup.
 	 *
-	 * Backs up custom tables (not in install.sql) that should survive the
-	 * reset. For field_* tables, cross-references the `fields` table: only
-	 * fields with a registered entry are backed up. Orphaned field tables
-	 * (from modules that were uninstalled but didn't clean up their tables)
-	 * are skipped. Non-field tables (fieldtype_options, pages_meta, etc.)
-	 * are always backed up.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @param array $canonicalTables Map of table_name => true from getCanonicalTables
-	 * @return array Array of [table => ['create' => ..., 'rows' => [...]]]
-	 */
-	protected function backupCustomTables($database, array $canonicalTables) {
-		$backup = [];
-		$allTables = $database->query("SHOW TABLES")->fetchAll(\PDO::FETCH_COLUMN);
-
-		// Build a set of legitimate field_* table names by querying the
-		// fields table BEFORE the reset. Every registered field has a
-		// corresponding field_<name> table. Unregistered field tables are
-		// orphans from improperly uninstalled modules.
-		$registeredFieldTables = [];
-		try {
-			$stmt = $database->query("SELECT name FROM fields");
-			while ($name = $stmt->fetchColumn()) {
-				$registeredFieldTables['field_' . $name] = true;
-			}
-		} catch (\PDOException $e) {
-			// If fields table is unreadable, skip the filter — back up everything
-		}
-
-		foreach ($allTables as $table) {
-			if (isset($canonicalTables[$table])) continue;
-
-			// For field_* tables: only back up if the field is registered in
-			// the fields table. Unregistered = orphaned from deleted module.
-			if (strpos($table, 'field_') === 0 && !empty($registeredFieldTables)) {
-				if (!isset($registeredFieldTables[$table])) continue;
-			}
-
-			$createSql = $this->getCreateTable($database, $table);
-			if (empty($createSql)) continue;
-
-			$safeTable = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
-			$rows = [];
-			try {
-				$stmt = $database->query("SELECT * FROM `$safeTable`");
-				$rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
-			} catch (\PDOException $e) {
-				continue;
-			}
-
-			$backup[$safeTable] = [
-				'create' => $createSql,
-				'rows' => $rows,
-			];
-		}
-
-		return $backup;
-	}
-
-	/**
-	 * Restore backed-up custom tables after the DB reset
-	 *
-	 * Unconditionally restores every table in the backup. Orphan filtering
-	 * has already happened in backupCustomTables() by cross-referencing the
-	 * `fields` table — so everything in the backup is legitimate.
-	 *
-	 * Uses DROP IF EXISTS + CREATE to overwrite any empty version that a
-	 * module's install() may have just created with the backed-up data.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @param array $customTables Output of backupCustomTables()
-	 * @return array List of restored table names
+	 * @return string[] Restored table names
 	 */
 	protected function restoreCustomTables($database, array $customTables) {
-		if (empty($customTables)) return [];
-
+		if(empty($customTables)) return [];
 		$database->exec("SET FOREIGN_KEY_CHECKS = 0");
-
 		$restored = [];
-
-		foreach ($customTables as $table => $tableData) {
+		foreach($customTables as $table => $data) {
 			$database->exec("DROP TABLE IF EXISTS `$table`");
-			$database->exec($tableData['create']);
-
-			foreach ($tableData['rows'] as $row) {
-				if (empty($row)) continue;
-
-				$cols = array_keys($row);
-				$colsSql = '`' . implode('`,`', $cols) . '`';
-				$placeholders = [];
-				$bindParams = [];
-				foreach ($cols as $i => $col) {
-					$ph = ':v' . $i;
-					$placeholders[] = $ph;
-					$bindParams[$ph] = $row[$col];
+			$database->exec($data['create']);
+			foreach($data['rows'] as $row) {
+				if(empty($row)) continue;
+				$cols   = array_keys($row);
+				$colSql = '`' . implode('`,`', $cols) . '`';
+				$params = [];
+				$phs    = [];
+				foreach($cols as $i => $col) {
+					$ph        = ':v' . $i;
+					$phs[]     = $ph;
+					$params[$ph] = $row[$col];
 				}
-				$phSql = implode(',', $placeholders);
-
 				try {
-					$stmt = $database->prepare(
-						"INSERT INTO `$table` ($colsSql) VALUES ($phSql)"
-					);
-					$stmt->execute($bindParams);
-				} catch (\PDOException $e) {
-					// Continue on row errors — don't fail the whole table
+					$database->prepare("INSERT INTO `$table` ($colSql) VALUES (" . implode(',', $phs) . ")")
+						->execute($params);
+				} catch(\PDOException $e) {
 					$this->wire('log')->error("ProcessWireReset: row insert failed for `$table`: " . $e->getMessage());
 				}
 			}
-
 			$restored[] = $table;
 		}
-
 		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
-
 		return $restored;
 	}
 
 	/**
-	 * Drop ALL tables in the current database
-	 *
-	 * Uses INFORMATION_SCHEMA scoped to the current DB (more reliable than
-	 * SHOW TABLES which can return stale results in some MySQL setups) and
-	 * a multi-pass approach to handle any tables that resist a single-pass
-	 * drop (e.g. due to FK constraints, table cache issues, or concurrent
-	 * connections). After dropping, throws if any tables remain.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @throws WireException If tables remain after all drop passes
-	 */
-	/**
-	 * Detect the actual charset used by existing PW tables
-	 *
-	 * Queries information_schema for the collation of the 'caches' table
-	 * (always exists in a PW install) and extracts the charset prefix.
-	 * This is the only reliable way to determine the target charset —
-	 * $config->dbCharset and @@character_set_database can both lie.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @param Config $config
-	 * @return string Charset name (e.g. 'utf8mb3', 'utf8', 'utf8mb4')
-	 */
-	protected function detectTableCharset($database, $config) {
-		$dbName = $config->dbName;
-		try {
-			$stmt = $database->prepare(
-				"SELECT TABLE_COLLATION FROM information_schema.TABLES " .
-				"WHERE TABLE_SCHEMA = :db AND TABLE_NAME = 'caches' LIMIT 1"
-			);
-			$stmt->execute([':db' => $dbName]);
-			$collation = $stmt->fetchColumn();
-			if ($collation) {
-				// Extract charset from collation: utf8mb3_general_ci → utf8mb3
-				$parts = explode('_', $collation, 2);
-				return $parts[0];
-			}
-		} catch (\PDOException $e) {
-			// Fall through
-		}
-		// Fallback
-		return $config->dbCharset ?: 'utf8';
-	}
-
-	protected function dropAllTables($database) {
-		$dbName = $this->wire('config')->dbName;
-
-		$database->exec("SET FOREIGN_KEY_CHECKS = 0");
-
-		$maxPasses = 5;
-		for ($pass = 0; $pass < $maxPasses; $pass++) {
-			$stmt = $database->prepare(
-				"SELECT TABLE_NAME FROM information_schema.TABLES " .
-				"WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE'"
-			);
-			$stmt->execute([':db' => $dbName]);
-			$tables = $stmt->fetchAll(\PDO::FETCH_COLUMN);
-
-			if (empty($tables)) break;
-
-			foreach ($tables as $table) {
-				$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
-				if ($safe === '') continue;
-				try {
-					$database->exec("DROP TABLE IF EXISTS `$safe`");
-				} catch (\PDOException $e) {
-					// Continue — retry in next pass
-				}
-			}
-		}
-
-		// Also drop any views that may exist
-		try {
-			$stmt = $database->prepare(
-				"SELECT TABLE_NAME FROM information_schema.TABLES " .
-				"WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'VIEW'"
-			);
-			$stmt->execute([':db' => $dbName]);
-			$views = $stmt->fetchAll(\PDO::FETCH_COLUMN);
-			foreach ($views as $view) {
-				$safe = preg_replace('/[^a-zA-Z0-9_]/', '', $view);
-				if ($safe !== '') $database->exec("DROP VIEW IF EXISTS `$safe`");
-			}
-		} catch (\PDOException $e) {
-			// Ignore — views are optional cleanup
-		}
-
-		$database->exec("SET FOREIGN_KEY_CHECKS = 1");
-
-		// Verify clean state
-		$stmt = $database->prepare(
-			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = :db"
-		);
-		$stmt->execute([':db' => $dbName]);
-		$remaining = (int) $stmt->fetchColumn();
-		if ($remaining > 0) {
-			throw new WireException(
-				"dropAllTables: $remaining table(s) could not be dropped from database '$dbName'"
-			);
-		}
-	}
-
-	/**
-	 * Re-register ProcessWireReset itself in the fresh modules table
-	 *
-	 * Only self is restored immediately. Other kept modules are deferred
-	 * via writePendingInstalls() so their install() side effects (admin
-	 * pages, custom tables, fields) are recreated on the next request.
-	 *
-	 * @param WireDatabasePDO $database
-	 * @param array $keptModuleData
+	 * Insert ProcessWireReset into the fresh modules table.
+	 * Only self is registered immediately; other kept modules are deferred.
 	 */
 	protected function restoreSelfModule($database, array $keptModuleData) {
-		$selfClass = $this->className();
-		$selfData = isset($keptModuleData[$selfClass]) ? $keptModuleData[$selfClass] : [
-			'class' => $selfClass,
-			'flags' => 0,
-			'data' => '',
-		];
-
+		$self = $this->className();
 		$stmt = $database->prepare("SELECT id FROM modules WHERE class = :class");
-		$stmt->execute([':class' => $selfClass]);
-		if ($stmt->fetch()) return;
+		$stmt->execute([':class' => $self]);
+		if($stmt->fetch()) return;
 
-		$stmt = $database->prepare(
+		$backup = $keptModuleData[$self] ?? ['class' => $self, 'flags' => 0, 'data' => ''];
+		$database->prepare(
 			"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
-		);
-		$stmt->execute([
-			':class' => $selfClass,
-			':flags' => $selfData['flags'],
-			':data' => $selfData['data'],
+		)->execute([
+			':class' => $self,
+			':flags' => (int) $backup['flags'],
+			':data'  => (string) $backup['data'],
 		]);
 	}
 
 	/**
-	 * Write kept modules (except self) to the pending-installs file
+	 * Write the pending-installs JSON file.
+	 * Lists every kept module (except self) in topological install order,
+	 * with backed-up flags + data for those that had a pre-reset entry.
 	 *
-	 * The next request loads ProcessWireReset as autoload (triggered by the
-	 * presence of this file), and processPendingInstalls() calls each
-	 * module's install() to recreate admin pages, tables, and other side
-	 * effects, then restores the backed-up config.
-	 *
-	 * @param array $keptModuleData
-	 * @param array $installOrder
-	 * @throws WireException If the pending file cannot be written
+	 * @throws WireException if the file cannot be written
 	 */
 	protected function writePendingInstalls(array $keptModuleData, array $installOrder) {
-		$selfClass = $this->className();
+		$self    = $this->className();
 		$pending = [];
-
-		foreach ($installOrder as $className) {
-			if ($className === $selfClass) continue;
-
+		foreach($installOrder as $className) {
+			if($className === $self) continue;
 			$item = ['class' => $className];
-			// Include backed-up config for modules that were previously
-			// installed (user selection + their site-module transitive deps).
-			// Core modules added as dependencies have no backup data and
-			// will be installed with their default config.
-			if (isset($keptModuleData[$className])) {
-				$item['flags'] = (int) $keptModuleData[$className]['flags'];
-				$item['data'] = (string) $keptModuleData[$className]['data'];
+			if(isset($keptModuleData[$className])) {
+				$item['flags'] = (int)    $keptModuleData[$className]['flags'];
+				$item['data']  = (string) $keptModuleData[$className]['data'];
 			}
 			$pending[] = $item;
 		}
 
-		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
-		if (empty($pending)) {
-			if (file_exists($pendingFile) && !unlink($pendingFile)) {
-				$this->wire('log')->error("ProcessWireReset: Could not remove pending file: $pendingFile");
-			}
+		$file = __DIR__ . '/' . self::PENDING_FILE;
+		if(empty($pending)) {
+			if(file_exists($file)) @unlink($file);
 			return;
 		}
-		$json = json_encode($pending, JSON_PRETTY_PRINT);
-		if (file_put_contents($pendingFile, $json) === false) {
-			$this->wire('log')->error("ProcessWireReset: Could not write pending file: $pendingFile");
-			throw new WireException(
-				"Cannot write pending installs file at $pendingFile — kept modules will not be restored after reset."
-			);
+		if(file_put_contents($file, json_encode($pending, JSON_PRETTY_PRINT)) === false) {
+			throw new WireException("Cannot write pending-installs file: $file");
 		}
 	}
 
 	/**
-	 * Write backed-up custom tables to a pending file for deferred restore
+	 * Serialize and write the backed-up custom tables to a pending file.
+	 * Processed in processPendingCustomTables() on the next request.
 	 *
-	 * Custom tables cannot be restored immediately after the DB reset: doing
-	 * so would conflict with the kept modules' install() methods on the next
-	 * request (which try to CREATE TABLE for their own storage). Instead we
-	 * serialize the backup to a pending file and restore it in
-	 * processPendingCustomTables() — after all install() calls have finished.
-	 *
-	 * Uses PHP serialize() rather than JSON because table rows may contain
-	 * binary data, non-UTF8 strings, or other non-JSON-safe values.
-	 *
-	 * @param array $customTables Output of backupCustomTables()
-	 * @throws WireException If the pending file cannot be written
+	 * @throws WireException if the file cannot be written
 	 */
 	protected function writePendingCustomTables(array $customTables) {
-		$pendingFile = __DIR__ . '/' . self::PENDING_TABLES_FILE;
-
-		if (empty($customTables)) {
-			if (file_exists($pendingFile) && !unlink($pendingFile)) {
-				$this->wire('log')->error("ProcessWireReset: Could not remove pending tables file: $pendingFile");
-			}
+		$file = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+		if(empty($customTables)) {
+			if(file_exists($file)) @unlink($file);
 			return;
 		}
-
-		$serialized = serialize($customTables);
-		if (file_put_contents($pendingFile, $serialized) === false) {
-			$this->wire('log')->error("ProcessWireReset: Could not write pending tables file: $pendingFile");
-			throw new WireException(
-				"Cannot write pending custom tables file at $pendingFile — module table data will not be restored."
-			);
+		if(file_put_contents($file, serialize($customTables)) === false) {
+			throw new WireException("Cannot write pending-tables file: $file");
 		}
 	}
 
-	/**
-	 * Disable autoloaded debug tools and suppress errors
-	 *
-	 * Autoload modules like TracyDebugger register PHP shutdown handlers.
-	 * When we delete their files, those handlers fail fatally on exit.
-	 * This method disables known debug tools and suppresses all error
-	 * output so shutdown handlers of deleted modules fail silently.
-	 */
-	protected function silenceAutoloadModules() {
-		// Suppress all error output from this point on
-		error_reporting(0);
-		ini_set('display_errors', '0');
-
-		// Disable TracyDebugger specifically if loaded
-		if (class_exists('\Tracy\Debugger', false)) {
-			\Tracy\Debugger::$showBar = false;
-			\Tracy\Debugger::enable(\Tracy\Debugger::ProductionMode);
-		}
-
-		// Clear output buffers registered by debug tools
-		while (ob_get_level() > 0) {
-			ob_end_clean();
-		}
-	}
-
-	// =====================================================================
-	// Path Resolution Helpers
-	// =====================================================================
+	// =========================================================================
+	// Module resolution helpers
+	// =========================================================================
 
 	/**
-	 * Resolve the path to the profile's install.sql
-	 *
-	 * For custom profile paths, the resolved absolute path is verified to
-	 * lie within the PW root directory to prevent directory traversal
-	 * (e.g. "../../../etc/passwd" would be rejected).
-	 *
-	 * @param array $data Module config data
-	 * @return string|null Absolute path to install.sql or null if invalid
-	 */
-	protected function resolveProfileInstallSql(array $data) {
-		if (!empty($data['profilePath'])) {
-			$profilePath = $this->resolveProfilePath($data['profilePath']);
-			$candidate = rtrim($profilePath, '/') . '/install/install.sql';
-			$path = realpath($candidate);
-			if ($path === false) return null;
-			if (!$this->isPathAllowed($path)) return null;
-			return is_file($path) ? $path : null;
-		}
-		return __DIR__ . '/install/install.sql';
-	}
-
-	/**
-	 * Resolve the path to the profile's template files
-	 *
-	 * For the bundled default, templates live in install/site-templates/.
-	 * For custom profiles, templates are at <profilePath>/templates/.
-	 * Custom paths are validated against the PW root to prevent directory
-	 * traversal.
-	 *
-	 * @param array $data Module config data
-	 * @return string|null Absolute path to templates dir or null if invalid
-	 */
-	protected function resolveProfileTemplatesPath(array $data) {
-		if (!empty($data['profilePath'])) {
-			$profilePath = $this->resolveProfilePath($data['profilePath']);
-			$candidate = rtrim($profilePath, '/') . '/templates/';
-			$path = realpath($candidate);
-			if ($path === false) return null;
-			if (!$this->isPathAllowed($path)) return null;
-			return is_dir($path) ? $path : null;
-		}
-		$path = __DIR__ . '/install/site-templates/';
-		return is_dir($path) ? $path : null;
-	}
-
-	/**
-	 * Resolve a profile path that may be relative or absolute
-	 *
-	 * Relative paths are resolved against the PW root directory, so
-	 * users can enter "site-rockfrontend/install/" instead of the full
-	 * absolute path.
-	 *
-	 * @param string $path User-supplied path
-	 * @return string Absolute path
-	 */
-	protected function resolveProfilePath($path) {
-		$path = trim($path);
-		// Already absolute
-		if ($path !== '' && $path[0] === '/') return $path;
-		// Relative — prepend PW root
-		return rtrim($this->wire('config')->paths->root, '/') . '/' . $path;
-	}
-
-	/**
-	 * Verify that an absolute path is within the PW root directory
-	 *
-	 * Prevents directory traversal attacks via user-supplied profile paths.
-	 *
-	 * @param string $absolutePath A real (canonicalized) absolute path
-	 * @return bool True if the path is inside the PW root
-	 */
-	protected function isPathAllowed($absolutePath) {
-		$root = realpath($this->wire('config')->paths->root);
-		if ($root === false) return false;
-		return strpos($absolutePath, rtrim($root, '/') . '/') === 0
-			|| $absolutePath === $root;
-	}
-
-	/**
-	 * Sanitize a URL for use in a Location header
-	 *
-	 * Allows only same-host or relative URLs to prevent open-redirect /
-	 * header-injection attacks. Falls back to "./" if the URL points to
-	 * a different host or contains CR/LF.
-	 *
-	 * @param string $url
-	 * @return string Safe URL for Location header
-	 */
-	protected function safeRedirectUrl($url) {
-		// Strip any CR/LF (header injection guard)
-		$url = str_replace(["\r", "\n"], '', (string) $url);
-		if ($url === '') return './';
-
-		$parsed = parse_url($url);
-		if ($parsed === false) return './';
-
-		// If a host is specified, it must match the current request host
-		if (!empty($parsed['host'])) {
-			$currentHost = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
-			if ($parsed['host'] !== $currentHost) return './';
-		}
-
-		return $url;
-	}
-
-	/**
-	 * Expand the user's keep-modules selection to include transitive deps
-	 *
-	 * Walks each selected module's 'requires' info and recursively includes
-	 * any site-module (not core) dependencies. This ensures that preserving
-	 * Module A also preserves the site modules it needs to function (B → C → ...).
-	 * Core modules are excluded because they always live in wire/modules/
-	 * and survive a reset untouched.
-	 *
-	 * @param array $keepModules User-selected module class names
-	 * @return array Expanded list including transitive site-module dependencies
+	 * Expand the keep-modules list to include transitive site-module dependencies.
+	 * Core modules (wire/modules/) are excluded — they always survive a reset.
 	 */
 	protected function expandKeepModules(array $keepModules) {
-		$modules = $this->wire('modules');
+		$modules         = $this->wire('modules');
 		$siteModulesPath = $this->wire('config')->paths->siteModules;
-		$selfClass = $this->className();
+		$self            = $this->className();
+		$resolved        = [];
+		$stack           = array_values(array_unique($keepModules));
 
-		$resolved = [];
-		$stack = array_values(array_unique($keepModules));
-
-		while (!empty($stack)) {
+		while(!empty($stack)) {
 			$className = array_shift($stack);
-			if (empty($className) || isset($resolved[$className])) continue;
-			if ($className === $selfClass) continue;
+			if(empty($className) || isset($resolved[$className]) || $className === $self) continue;
 
-			// Only include site modules — core modules always survive
 			$path = $modules->getModuleFile($className);
-			if (!$path || strpos($path, $siteModulesPath) !== 0) continue;
+			if(!$path || strpos($path, $siteModulesPath) !== 0) continue;
 
 			$resolved[$className] = true;
-
 			$info = $modules->getModuleInfoVerbose($className);
 
-			// Follow 'requires' — modules this one depends on
-			foreach ((array) (isset($info['requires']) ? $info['requires'] : []) as $req) {
-				if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m)) {
-					if (!isset($resolved[$m[1]])) $stack[] = $m[1];
+			foreach((array) ($info['requires'] ?? []) as $req) {
+				if(preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m) && !isset($resolved[$m[1]])) {
+					$stack[] = $m[1];
 				}
 			}
-
-			// Follow 'installs' — bundled modules co-installed with this one
-			foreach ((array) (isset($info['installs']) ? $info['installs'] : []) as $coModule) {
-				if (!empty($coModule) && !isset($resolved[$coModule])) {
-					$stack[] = $coModule;
-				}
+			foreach((array) ($info['installs'] ?? []) as $co) {
+				if(!empty($co) && !isset($resolved[$co])) $stack[] = $co;
 			}
 		}
-
 		return array_keys($resolved);
 	}
 
 	/**
-	 * Resolve the full install order including core-module dependencies
+	 * Topological sort (Kahn's algorithm) of ALL transitive dependencies —
+	 * both site and core — so that each module can be installed individually
+	 * in the correct order without relying on PW's nested auto-install.
 	 *
-	 * Walks the dependency graph starting from the user's selection,
-	 * collecting ALL transitive dependencies (both site and core modules).
-	 * Then performs a topological sort (Kahn's algorithm) so that
-	 * dependencies come before the modules that depend on them — ensuring
-	 * each module can be installed individually without relying on PW's
-	 * nested auto-install logic.
-	 *
-	 * Core modules that must be explicitly installed (e.g. InputfieldCKEditor,
-	 * FieldtypeMapMarker) are included in the list; already-installed core
-	 * modules will be skipped by the install loop via the DB-direct check.
-	 *
-	 * @param array $keepModules Expanded keep-modules list (site modules)
-	 * @return array Class names in topological order (deps first)
+	 * @return string[] Class names, dependencies first
 	 */
 	protected function resolveInstallOrder(array $keepModules) {
-		$modules = $this->wire('modules');
-		$selfClass = $this->className();
+		$modules  = $this->wire('modules');
+		$self     = $this->className();
+		$requires = [];
+		$queue    = array_values(array_unique($keepModules));
 
-		// Step 1: BFS through dependency graph, collecting requires + installs
-		$requires = [];  // class => [dep1, dep2, ...] (hard deps for topo sort)
-		$queue = array_values(array_unique($keepModules));
-
-		while (!empty($queue)) {
+		while(!empty($queue)) {
 			$className = array_shift($queue);
-			if (empty($className) || isset($requires[$className])) continue;
-			if ($className === $selfClass) continue;
-			if ($className === 'ProcessWire' || $className === 'PHP') continue;
+			if(empty($className) || isset($requires[$className])) continue;
+			if($className === $self || $className === 'ProcessWire' || $className === 'PHP') continue;
 
-			// Only consider modules that actually exist as files
 			$path = $modules->getModuleFile($className);
-			if (!$path) continue;
+			if(!$path) continue;
 
 			$info = $modules->getModuleInfoVerbose($className);
 			$deps = [];
-
-			// Follow 'requires' — hard dependencies that define install order
-			foreach ((array) (isset($info['requires']) ? $info['requires'] : []) as $req) {
-				if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m)) {
-					$depClass = $m[1];
-					if ($depClass === 'ProcessWire' || $depClass === 'PHP') continue;
-					if ($depClass === $selfClass) continue;
-					$deps[] = $depClass;
-					if (!isset($requires[$depClass])) {
-						$queue[] = $depClass;
-					}
+			foreach((array) ($info['requires'] ?? []) as $req) {
+				if(preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $req, $m)) {
+					$dep = $m[1];
+					if($dep === 'ProcessWire' || $dep === 'PHP' || $dep === $self) continue;
+					$deps[] = $dep;
+					if(!isset($requires[$dep])) $queue[] = $dep;
 				}
 			}
-
-			// Follow 'installs' — bundled co-installed modules. These don't
-			// create a hard ordering constraint (the parent installs them),
-			// but they must be in the graph so their config gets backed up.
-			foreach ((array) (isset($info['installs']) ? $info['installs'] : []) as $coModule) {
-				if (empty($coModule)) continue;
-				if ($coModule === $selfClass || $coModule === 'ProcessWire' || $coModule === 'PHP') continue;
-				if (!isset($requires[$coModule])) {
-					$queue[] = $coModule;
-				}
+			foreach((array) ($info['installs'] ?? []) as $co) {
+				if(empty($co) || $co === $self) continue;
+				if(!isset($requires[$co])) $queue[] = $co;
 			}
-
 			$requires[$className] = $deps;
 		}
 
-		// Step 2: Topological sort via Kahn's algorithm
-		// in-degree of X = number of X's dependencies that are also in our set
-		$inDegree = [];
-		foreach ($requires as $class => $deps) {
-			$inDegree[$class] = 0;
-		}
-		foreach ($requires as $class => $deps) {
-			foreach ($deps as $dep) {
-				if (isset($requires[$dep])) {
-					$inDegree[$class]++;
-				}
+		// Kahn's algorithm
+		$inDegree = array_fill_keys(array_keys($requires), 0);
+		foreach($requires as $deps) {
+			foreach($deps as $dep) {
+				if(isset($inDegree[$dep])) $inDegree[$dep]++;
 			}
 		}
 
-		// Start with modules that have no unresolved dependencies
-		$ready = [];
-		foreach ($inDegree as $class => $degree) {
-			if ($degree === 0) $ready[] = $class;
-		}
-
+		$ready  = array_keys(array_filter($inDegree, fn($d) => $d === 0));
 		$sorted = [];
-		while (!empty($ready)) {
-			$class = array_shift($ready);
-			$sorted[] = $class;
-			// Decrement in-degree of modules that depend on $class
-			foreach ($requires as $other => $otherDeps) {
-				if (!in_array($class, $otherDeps)) continue;
-				if (!isset($inDegree[$other]) || $inDegree[$other] <= 0) continue;
-				$inDegree[$other]--;
-				if ($inDegree[$other] === 0) {
-					$ready[] = $other;
-				}
+		while(!empty($ready)) {
+			$cls     = array_shift($ready);
+			$sorted[] = $cls;
+			foreach($requires as $other => $deps) {
+				if(!in_array($cls, $deps, true)) continue;
+				if(--$inDegree[$other] === 0) $ready[] = $other;
 			}
 		}
 
-		// Append any modules with remaining dependencies (cycles or
-		// unresolved refs) at the end as a safety net
-		foreach ($requires as $class => $deps) {
-			if (!in_array($class, $sorted)) {
-				$sorted[] = $class;
-			}
+		// Append any remaining (cycles / unresolved)
+		foreach(array_keys($requires) as $cls) {
+			if(!in_array($cls, $sorted, true)) $sorted[] = $cls;
 		}
-
 		return $sorted;
 	}
 
 	/**
-	 * Resolve which module directory names to keep in site/modules/
-	 *
-	 * @param array $data Module config data
-	 * @return array Directory/file names to preserve
+	 * Resolve the top-level directory/file names in site/modules/ to keep.
+	 * Always includes self.
 	 */
 	protected function resolveKeepModuleDirs(array $data) {
-		$modules = $this->wire('modules');
+		$modules         = $this->wire('modules');
 		$siteModulesPath = $this->wire('config')->paths->siteModules;
-		$dirs = [$this->className()];
+		$dirs            = [$this->className()];
 
-		foreach ((array) $data['keepModules'] as $className) {
+		foreach((array) ($data['keepModules'] ?? []) as $className) {
 			$path = $modules->getModuleFile($className);
-			if (!$path || strpos($path, $siteModulesPath) !== 0) continue;
-
-			$relative = substr($path, strlen($siteModulesPath));
-			$parts = explode('/', $relative);
-			if (!empty($parts[0])) $dirs[] = $parts[0];
+			if(!$path || strpos($path, $siteModulesPath) !== 0) continue;
+			$rel  = substr($path, strlen($siteModulesPath));
+			$top  = explode('/', $rel)[0];
+			if(!empty($top)) $dirs[] = $top;
 		}
-
 		return array_unique($dirs);
 	}
 
-	// =====================================================================
-	// Filesystem Helpers
-	// =====================================================================
+	// =========================================================================
+	// Path resolution helpers
+	// =========================================================================
 
 	/**
-	 * Record a filesystem operation failure
+	 * Resolve the path to the profile's install.sql.
+	 * Validates against PW root to prevent directory traversal.
 	 *
-	 * Adds the failure to $this->fsFailures so Phase 3 can detect it at
-	 * the end and raise a WireException. Also logs to PW's log system.
-	 *
-	 * @param string $message
+	 * @return string|null Absolute path or null on failure
 	 */
-	protected function fsFailure($message) {
-		$this->fsFailures[] = $message;
-		// Use direct file write as fallback — wire('log') may not work after
-		// silenceAutoloadModules() sets error_reporting(0).
-		try {
-			$this->wire('log')->save('processwirereset', $message);
-		} catch (\Exception $e) {
-			// Fallback: write directly to log file
-			$logDir = $this->wire('config')->paths->assets . 'logs/';
-			if (is_dir($logDir)) {
-				@file_put_contents(
-					$logDir . 'processwirereset.txt',
-					date('Y-m-d H:i:s') . " $message\n",
-					FILE_APPEND
-				);
-			}
+	protected function resolveProfileInstallSql(array $data) {
+		if(!empty($data['profilePath'])) {
+			$base      = $this->resolveProfilePath($data['profilePath']);
+			$candidate = rtrim($base, '/') . '/install/install.sql';
+			$real      = realpath($candidate);
+			if($real === false || !$this->isPathAllowed($real) || !is_file($real)) return null;
+			return $real;
 		}
+		$bundled = __DIR__ . '/install/install.sql';
+		return is_file($bundled) ? $bundled : null;
 	}
 
 	/**
-	 * Pre-flight filesystem permission check
+	 * Resolve the path to the profile's templates directory.
 	 *
-	 * Before the destructive phase starts, verify we can actually create
-	 * AND delete files in every directory the reset will touch. is_writable()
-	 * alone is not enough — on some setups files created by another user
-	 * cannot be deleted even if the parent directory is nominally writable.
+	 * @return string|null Absolute path or null on failure
+	 */
+	protected function resolveProfileTemplatesPath(array $data) {
+		if(!empty($data['profilePath'])) {
+			$base      = $this->resolveProfilePath($data['profilePath']);
+			$candidate = rtrim($base, '/') . '/templates/';
+			$real      = realpath($candidate);
+			if($real === false || !$this->isPathAllowed($real) || !is_dir($real)) return null;
+			return $real;
+		}
+		$bundled = __DIR__ . '/install/site-templates/';
+		return is_dir($bundled) ? $bundled : null;
+	}
+
+	/** Resolve a relative profile path against the PW root. */
+	protected function resolveProfilePath($path) {
+		$path = trim((string) $path);
+		if($path !== '' && $path[0] === '/') return $path;
+		return rtrim($this->wire('config')->paths->root, '/') . '/' . $path;
+	}
+
+	/** Guard against directory traversal: path must be inside PW root. */
+	protected function isPathAllowed($absolutePath) {
+		$root = realpath($this->wire('config')->paths->root);
+		if($root === false) return false;
+		return strpos($absolutePath, rtrim($root, '/') . '/') === 0 || $absolutePath === $root;
+	}
+
+	/** Sanitise a URL for the Location header — reject external hosts. */
+	protected function safeRedirectUrl($url) {
+		$url = str_replace(["\r", "\n"], '', (string) $url);
+		if($url === '') return './';
+		$parsed = parse_url($url);
+		if($parsed === false) return './';
+		if(!empty($parsed['host'])) {
+			$host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
+			if($parsed['host'] !== $host) return './';
+		}
+		return $url;
+	}
+
+	// =========================================================================
+	// Filesystem helpers
+	// =========================================================================
+
+	/**
+	 * Pre-flight check: verify write+delete access on every path the reset
+	 * will touch. Creates and immediately removes a temp file in each directory.
 	 *
-	 * The check creates a unique temporary file in each directory, then
-	 * immediately deletes it. If either step fails, the path is recorded as
-	 * unusable.
-	 *
-	 * @return string[] Array of human-readable error messages (empty = all OK)
+	 * @return string[] Human-readable error messages (empty = all OK)
 	 */
 	protected function preflightCheck() {
-		$config = $this->wire('config');
-		$sitePath = $config->paths->site;
-
-		// Paths the reset needs to write to / delete from
-		$paths = [
+		$sitePath = $this->wire('config')->paths->site;
+		$paths    = [
 			$sitePath . 'assets/files/',
 			$sitePath . 'assets/cache/',
 			$sitePath . 'assets/logs/',
 			$sitePath . 'assets/sessions/',
-			$sitePath . 'assets/',        // for installed.php write
+			$sitePath . 'assets/',
 			$sitePath . 'templates/',
 			$sitePath . 'modules/',
-			__DIR__ . '/',                // for pending files
+			__DIR__ . '/',
 		];
-
 		$errors = [];
-		foreach ($paths as $path) {
-			if (!is_dir($path)) {
-				// Missing dirs for assets are fine — emptyDirectory() will mkdir
-				// them. But we still need write access on the parent.
+		foreach($paths as $path) {
+			if(!is_dir($path)) {
 				$parent = dirname(rtrim($path, '/'));
-				if (!is_dir($parent) || !is_writable($parent)) {
-					$errors[] = "$path does not exist and its parent is not writable";
+				if(!is_dir($parent) || !is_writable($parent)) {
+					$errors[] = "$path: missing and parent not writable";
 				}
 				continue;
 			}
-
-			if (!is_writable($path)) {
-				$errors[] = "$path is not writable";
-				continue;
-			}
-
-			// Try the actual create + delete dance
-			$testFile = rtrim($path, '/') . '/.pwreset-preflight-' . uniqid('', true);
-			$written = @file_put_contents($testFile, 'ok');
-			if ($written === false) {
-				$errors[] = "$path: cannot create files (write failed)";
-				continue;
-			}
-			if (!@unlink($testFile)) {
-				$errors[] = "$path: cannot delete files (created a test file but could not remove it — $testFile)";
-				// Best effort: don't leave the test file behind
-				continue;
-			}
+			if(!is_writable($path)) { $errors[] = "$path: not writable"; continue; }
+			$tmp = rtrim($path, '/') . '/.pwreset-' . uniqid('', true);
+			if(@file_put_contents($tmp, 'ok') === false) { $errors[] = "$path: cannot create files"; continue; }
+			if(!@unlink($tmp)) $errors[] = "$path: cannot delete files ($tmp)";
 		}
-
-		// Also verify that the kept-module directories can be traversed
-		// (we recursively walk into them during cleanModulesDirectory and need
-		// to read file metadata there).
-		$modulesDir = $sitePath . 'modules/';
-		if (is_dir($modulesDir)) {
-			try {
-				$iter = new \DirectoryIterator($modulesDir);
-				foreach ($iter as $item) {
-					if ($item->isDot()) continue;
-					if (!$item->isReadable()) {
-						$errors[] = "$modulesDir{$item->getFilename()}: not readable";
-					}
-				}
-			} catch (\Exception $e) {
-				$errors[] = "$modulesDir: cannot iterate (" . $e->getMessage() . ")";
-			}
-		}
-
 		return $errors;
 	}
 
-	/**
-	 * Empty a directory (remove all contents but keep the directory itself)
-	 *
-	 * Skips any paths listed in $keepDirPaths. Failures are tracked in
-	 * $this->fsFailures.
-	 *
-	 * @param string $dir
-	 * @param array $keepDirPaths Map of absolute paths to preserve (optional)
-	 */
-	protected function emptyDirectory($dir, array $keepDirPaths = []) {
-		if (!is_dir($dir)) {
-			if (!mkdir($dir, $this->getChmodDir(), true) && !is_dir($dir)) {
-				$this->fsFailure("Could not create directory: $dir");
-			}
-			return;
-		}
-
+	/** Record a filesystem failure and log it. */
+	protected function fsFailure($message) {
+		$this->fsFailures[] = $message;
 		try {
-			$iterator = new \DirectoryIterator($dir);
-			foreach ($iterator as $item) {
-				if ($item->isDot()) continue;
-				$path = $item->getPathname();
-				if ($this->isKeptPath($path, $keepDirPaths)) continue;
-				if ($item->isDir()) {
-					$this->removeDirectoryRecursive($path);
-				} else {
-					if (!unlink($path)) {
-						$this->fsFailure("Could not delete file: $path");
-					}
-				}
-			}
-		} catch (\Exception $e) {
-			$this->fsFailure("Could not iterate directory $dir: " . $e->getMessage());
+			$this->wire('log')->save('processwirereset', $message);
+		} catch(\Exception $e) {
+			$logDir = $this->wire('config')->paths->assets . 'logs/';
+			if(is_dir($logDir)) @file_put_contents($logDir . 'processwirereset.txt',
+				date('Y-m-d H:i:s') . " $message\n", FILE_APPEND);
 		}
 	}
 
 	/**
-	 * Recursively remove a directory and all its contents
-	 *
-	 * Failures are tracked in $this->fsFailures and raised by Phase 3.
-	 *
-	 * @param string $dir
+	 * Empty a directory (delete all contents, keep the directory itself).
+	 * Paths in $keepDirPaths are skipped.
 	 */
-	protected function removeDirectoryRecursive($dir) {
-		if (!is_dir($dir)) return;
+	protected function emptyDirectory($dir, array $keepDirPaths = []) {
+		if(!is_dir($dir)) {
+			if(!mkdir($dir, $this->getChmodDir(), true) && !is_dir($dir)) {
+				$this->fsFailure("Cannot create directory: $dir");
+			}
+			return;
+		}
+		try {
+			foreach(new \DirectoryIterator($dir) as $item) {
+				if($item->isDot()) continue;
+				$path = $item->getPathname();
+				if($this->isKeptPath($path, $keepDirPaths)) continue;
+				if($item->isDir()) $this->removeDirectoryRecursive($path);
+				else if(!unlink($path)) $this->fsFailure("Cannot delete: $path");
+			}
+		} catch(\Exception $e) {
+			$this->fsFailure("Cannot iterate $dir: " . $e->getMessage());
+		}
+	}
 
+	/** Recursively delete a directory and all its contents. */
+	protected function removeDirectoryRecursive($dir) {
+		if(!is_dir($dir)) return;
 		try {
 			$items = new \RecursiveIteratorIterator(
 				new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
 				\RecursiveIteratorIterator::CHILD_FIRST
 			);
-
-			foreach ($items as $item) {
+			foreach($items as $item) {
 				$path = $item->getPathname();
-				$ok = $item->isDir() ? rmdir($path) : unlink($path);
-				if (!$ok) {
-					$this->fsFailure("Could not remove: $path");
-				}
+				$ok   = $item->isDir() ? rmdir($path) : unlink($path);
+				if(!$ok) $this->fsFailure("Cannot remove: $path");
 			}
-		} catch (\Exception $e) {
-			$this->fsFailure("Could not iterate directory $dir: " . $e->getMessage());
+		} catch(\Exception $e) {
+			$this->fsFailure("Cannot iterate $dir: " . $e->getMessage());
 			return;
 		}
-
-		if (!rmdir($dir)) {
-			$this->fsFailure("Could not remove directory: $dir");
-		}
+		if(!rmdir($dir)) $this->fsFailure("Cannot remove directory: $dir");
 	}
 
-	/**
-	 * Recursively copy a directory
-	 *
-	 * @param string $src Source directory
-	 * @param string $dst Destination directory
-	 */
+	/** Recursively copy $src into $dst. */
 	protected function copyDirectoryRecursive($src, $dst) {
-		if (!is_dir($dst)) {
-			if (!mkdir($dst, $this->getChmodDir(), true) && !is_dir($dst)) {
-				$this->fsFailure("Could not create directory: $dst");
-				return;
-			}
+		if(!is_dir($dst) && !mkdir($dst, $this->getChmodDir(), true) && !is_dir($dst)) {
+			$this->fsFailure("Cannot create: $dst");
+			return;
 		}
-
-		$iterator = new \DirectoryIterator($src);
-		foreach ($iterator as $item) {
-			if ($item->isDot()) continue;
-
-			$srcPath = $item->getPathname();
-			$dstPath = $dst . '/' . $item->getFilename();
-
-			if ($item->isDir()) {
-				$this->copyDirectoryRecursive($srcPath, $dstPath);
+		foreach(new \DirectoryIterator($src) as $item) {
+			if($item->isDot()) continue;
+			$s = $item->getPathname();
+			$d = $dst . '/' . $item->getFilename();
+			if($item->isDir()) {
+				$this->copyDirectoryRecursive($s, $d);
 			} else {
-				if (!copy($srcPath, $dstPath)) {
-					$this->fsFailure("Could not copy $srcPath to $dstPath");
-				} else {
-					chmod($dstPath, $this->getChmodFile());
-				}
+				if(!copy($s, $d)) $this->fsFailure("Cannot copy $s → $d");
+				else chmod($d, $this->getChmodFile());
 			}
 		}
 	}
 
 	/**
-	 * Get the octal permission for directories
-	 *
-	 * Uses the module config value if set, falls back to PW's $config->chmodDir,
-	 * then to 0755 as a last resort.
-	 *
-	 * @return int Permission as integer (for chmod/mkdir)
+	 * Clean site/assets/:
+	 *  - Standard subdirs (files, cache, logs, sessions) → emptied
+	 *  - Other subdirs created by modules → removed
+	 *  - installed.php, index.php, .htaccess → kept
 	 */
-	protected function getChmodDir() {
-		$val = $this->chmodDir;
-		if (empty($val)) $val = $this->wire('config')->chmodDir;
-		if (empty($val)) $val = '0755';
-		return octdec(ltrim($val, '0') ?: '755');
+	protected function cleanAssetsDirectory($assetsDir, array $keepDirPaths = []) {
+		if(!is_dir($assetsDir)) return;
+		$standardDirs  = ['files', 'cache', 'logs', 'sessions'];
+		$preserveFiles = ['installed.php', 'index.php', '.htaccess'];
+
+		foreach(new \DirectoryIterator($assetsDir) as $item) {
+			if($item->isDot()) continue;
+			$name = $item->getFilename();
+			$path = $item->getPathname();
+			if($this->isKeptPath($path, $keepDirPaths)) continue;
+
+			if($item->isDir()) {
+				if(in_array($name, $standardDirs, true)) $this->emptyDirectory($path, $keepDirPaths);
+				else $this->removeDirectoryRecursive($path);
+			} else {
+				if(in_array($name, $preserveFiles, true)) continue;
+				if(!unlink($path)) $this->fsFailure("Cannot delete: $path");
+			}
+		}
 	}
 
 	/**
-	 * Get the octal permission for files
-	 *
-	 * Uses the module config value if set, falls back to PW's $config->chmodFile,
-	 * then to 0644 as a last resort.
-	 *
-	 * @return int Permission as integer (for chmod)
+	 * Clean site/modules/ — remove everything except kept module dirs/files.
+	 * README files are always preserved.
 	 */
-	protected function getChmodFile() {
-		$val = $this->chmodFile;
-		if (empty($val)) $val = $this->wire('config')->chmodFile;
-		if (empty($val)) $val = '0644';
-		return octdec(ltrim($val, '0') ?: '644');
+	protected function cleanModulesDirectory($modulesDir, array $keepDirs) {
+		if(!is_dir($modulesDir)) return;
+		foreach(new \DirectoryIterator($modulesDir) as $item) {
+			if($item->isDot()) continue;
+			$name     = $item->getFilename();
+			$nameLower = strtolower($name);
+			if($nameLower === 'readme.txt' || $nameLower === 'readme.md') continue;
+			$baseName = pathinfo($name, PATHINFO_FILENAME);
+			if(in_array($name, $keepDirs, true) || in_array($baseName, $keepDirs, true)) continue;
+			$path = $item->getPathname();
+			if($item->isDir()) $this->removeDirectoryRecursive($path);
+			else if(!unlink($path)) $this->fsFailure("Cannot delete: $path");
+		}
 	}
 
 	/**
-	 * Parse the keepDirectories textarea into a set of absolute paths
+	 * Parse the keepDirectories textarea into a map of absolute paths.
+	 * Lines beginning with # are treated as comments.
 	 *
-	 * @param string $textarea Raw textarea content (one path per line)
-	 * @param string $sitePath Absolute path to site/ directory
-	 * @return array Map of absolute path => true
+	 * @return array  absolute_path => true
 	 */
 	protected function parseKeepDirectories($textarea, $sitePath) {
-		$result = [];
+		$result   = [];
 		$sitePath = rtrim($sitePath, '/') . '/';
-
-		foreach (explode("\n", (string) $textarea) as $line) {
+		foreach(explode("\n", (string) $textarea) as $line) {
 			$line = trim($line);
-			if ($line === '' || $line[0] === '#') continue; // skip blanks and comments
-
-			// Normalize: strip leading site/, leading/trailing slashes
+			if($line === '' || $line[0] === '#') continue;
 			$line = preg_replace('#^site/#', '', $line);
 			$line = trim($line, '/');
-			if ($line === '') continue;
-
-			$absPath = $sitePath . $line;
-			$result[rtrim($absPath, '/')]  = true;
+			if($line === '') continue;
+			$result[rtrim($sitePath . $line, '/')] = true;
 		}
-
 		return $result;
 	}
 
 	/**
-	 * Check if a path is inside any of the keep-directory paths
-	 *
-	 * @param string $path Absolute path to check
-	 * @param array $keepDirPaths Map of absolute path => true
-	 * @return bool
+	 * True if $path is inside, equal to, or a parent of any kept path.
+	 * Prevents deletion of kept directories and their ancestors.
 	 */
 	protected function isKeptPath($path, array $keepDirPaths) {
-		if (empty($keepDirPaths)) return false;
+		if(empty($keepDirPaths)) return false;
 		$path = rtrim($path, '/');
-
-		// Exact match or is a parent/child of a kept path
-		if (isset($keepDirPaths[$path])) return true;
-		foreach ($keepDirPaths as $kept => $v) {
-			// $path is inside a kept dir
-			if (strpos($path, $kept . '/') === 0) return true;
-			// $path IS a parent of a kept dir (don't delete parent!)
-			if (strpos($kept, $path . '/') === 0) return true;
+		if(isset($keepDirPaths[$path])) return true;
+		foreach($keepDirPaths as $kept => $v) {
+			if(strpos($path, $kept . '/') === 0) return true;  // $path inside kept
+			if(strpos($kept, $path . '/') === 0) return true;  // $path is parent of kept
 		}
 		return false;
 	}
 
-	/**
-	 * Clean site/assets/ — empty the standard dirs, wipe everything else
-	 *
-	 * The four standard PW dirs (files, cache, logs, sessions) have their
-	 * contents emptied but the directories themselves are preserved. Any
-	 * other entry in site/assets/ (files or directories created by modules,
-	 * e.g. TracyDebugger/, backups/, FormBuilder/, SearchEngine/) is
-	 * removed entirely — unless listed in $keepDirPaths.
-	 *
-	 * Preserved as-is (not touched):
-	 *   - installed.php (we rewrite it afterwards anyway)
-	 *   - index.php (access guard file sometimes placed here)
-	 *   - .htaccess (apache config)
-	 *
-	 * @param string $assetsDir Path to site/assets/
-	 * @param array $keepDirPaths Map of absolute paths to preserve
-	 */
-	protected function cleanAssetsDirectory($assetsDir, array $keepDirPaths = []) {
-		if (!is_dir($assetsDir)) return;
+	/** Directory permission as integer (for mkdir/chmod). */
+	protected function getChmodDir() {
+		$val = $this->chmodDir;
+		if(empty($val)) $val = $this->wire('config')->chmodDir;
+		if(empty($val)) $val = '0755';
+		return octdec(ltrim($val, '0') ?: '755');
+	}
 
-		$standardDirs = ['files', 'cache', 'logs', 'sessions'];
-		$preserveFiles = ['installed.php', 'index.php', '.htaccess'];
-
-		$iterator = new \DirectoryIterator($assetsDir);
-		foreach ($iterator as $item) {
-			if ($item->isDot()) continue;
-
-			$name = $item->getFilename();
-			$path = $item->getPathname();
-
-			if ($this->isKeptPath($path, $keepDirPaths)) continue;
-
-			if ($item->isDir()) {
-				if (in_array($name, $standardDirs, true)) {
-					$this->emptyDirectory($path, $keepDirPaths);
-				} else {
-					$this->removeDirectoryRecursive($path);
-				}
-			} else {
-				if (in_array($name, $preserveFiles, true)) continue;
-				if (!unlink($path)) {
-					$this->fsFailure("Could not delete file: $path");
-				}
-			}
-		}
+	/** File permission as integer (for chmod). */
+	protected function getChmodFile() {
+		$val = $this->chmodFile;
+		if(empty($val)) $val = $this->wire('config')->chmodFile;
+		if(empty($val)) $val = '0644';
+		return octdec(ltrim($val, '0') ?: '644');
 	}
 
 	/**
-	 * Clean site/modules/ — remove everything except kept module directories
-	 *
-	 * @param string $modulesDir Path to site/modules/
-	 * @param array $keepDirs Directory/file names to preserve
+	 * Disable debug-tool autoload modules and suppress error output.
+	 * Prevents Tracy/similar shutdown handlers from fataling when their files
+	 * are deleted during Phase 3.
 	 */
-	protected function cleanModulesDirectory($modulesDir, array $keepDirs) {
-		if (!is_dir($modulesDir)) return;
-
-		$iterator = new \DirectoryIterator($modulesDir);
-		foreach ($iterator as $item) {
-			if ($item->isDot()) continue;
-
-			$name = $item->getFilename();
-
-			// Always keep README files
-			$nameLower = strtolower($name);
-			if ($nameLower === 'readme.txt' || $nameLower === 'readme.md') continue;
-
-			// Keep if in the preserve list
-			$baseName = pathinfo($name, PATHINFO_FILENAME);
-			if (in_array($name, $keepDirs) || in_array($baseName, $keepDirs)) continue;
-
-			$path = $item->getPathname();
-			if ($item->isDir()) {
-				$this->removeDirectoryRecursive($path);
-			} else {
-				if (!unlink($path)) {
-					$this->fsFailure("Could not delete file: $path");
-				}
-			}
+	protected function silenceAutoloadModules() {
+		error_reporting(0);
+		ini_set('display_errors', '0');
+		if(class_exists('\Tracy\Debugger', false)) {
+			\Tracy\Debugger::$showBar = false;
+			\Tracy\Debugger::enable(\Tracy\Debugger::ProductionMode);
 		}
+		while(ob_get_level() > 0) ob_end_clean();
 	}
 }

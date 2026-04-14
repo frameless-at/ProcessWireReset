@@ -1,56 +1,44 @@
 <?php namespace ProcessWire;
 
-// Load the exact upstream Installer class from ProcessWire's install.php.
+// Load the upstream Installer class verbatim from vendor/Installer.php.
 // Only lines 1-2117 (the class body) are kept — the procedural self-execution
-// at the bottom (which would immediately run the installer) is stripped.
-// The file is in vendor/Installer.php and stays in the ProcessWire namespace.
+// at the bottom is stripped so including the file is safe inside a live PW request.
 if(!class_exists('\\ProcessWire\\Installer', false)) {
 	require_once __DIR__ . '/vendor/Installer.php';
 }
 
 /**
- * InstallerCore — headless extension of ProcessWire's own Installer class.
+ * InstallerCore — headless subclass of ProcessWire's own Installer.
  *
- * Only the parts that don't work when called from inside a running PW instance
- * are overridden here:
+ * Overrides only the parts that cannot work inside a live PW instance:
  *
- *  - HTML/output methods (alert, ok, err, h, p, btn, …)
- *      Silenced — messages collected in $this->messages / $this->errors instead.
+ *  Output / UI methods  — silenced; errors collected in $this->errors[].
+ *  profileImportSQL()   — require_once + absolute path (plain require() causes
+ *                         "Cannot redeclare class WireDatabaseBackup" in live PW).
+ *  getRemoveableItems() — disabled (must not delete install.php / site/install/
+ *                         during a reset; those files are the profile).
+ *  finish()             — path-corrected (__DIR__ would resolve to vendor/).
  *
- *  - getRemoveableItems()
- *      Disabled — a reset must not delete install.php or site/install/, since
- *      those files are needed for subsequent resets.
- *
- *  - finish()
- *      Path corrected — the original uses __DIR__ which would point to the
- *      module's vendor/ folder. We resolve the path via $config->paths->root.
- *
- *  - profileImportSQL()
- *      require_once replaces require — WireDatabaseBackup is already loaded
- *      inside a live PW instance; a plain require() would trigger a fatal
- *      "Cannot redeclare class" error.
- *
- * Everything else — especially adminAccountSave(), which calls
- * getInstall('AdminThemeUikit') and sets useLoginScreen — runs verbatim from
- * the upstream Installer class.
+ * All other logic — including the DB-import mechanics of profileImportSQL() —
+ * runs verbatim from the upstream class.
  */
 class InstallerCore extends Installer {
 
-	// Re-declared public so executeReset() can read/write them from outside.
+	// Re-declared public so executeReset() can read/write them.
 	// Parent declares all four as protected; PHP allows widening visibility
 	// in a subclass (protected → public is valid).
-	public $chmodDir = '0755';
-	public $chmodFile = '0644';
-	public $numErrors = 0;
-	public $inSection = false;
+	public $chmodDir   = '0755';
+	public $chmodFile  = '0644';
+	public $numErrors  = 0;
+	public $inSection  = false;
 
-	/** @var string[] Info/ok messages collected during run (replaces echo) */
+	/** @var string[] Messages collected during import (replaces HTML output) */
 	public $messages = [];
 
-	/** @var string[] Error messages collected during run (replaces echo) */
+	/** @var string[] Error messages collected during import */
 	public $errors = [];
 
-	// ── Output / GUI methods — all silenced ──────────────────────────────
+	// ── Output / UI methods — all silenced ───────────────────────────────────
 
 	protected function alert($str, $type = 'primary', $icon = 'check') {}
 	protected function alertOk($str, $icon = 'check') {}
@@ -84,27 +72,14 @@ class InstallerCore extends Installer {
 	public function sectionStop() {}
 	public function clear() {}
 
-	// ── Public wrappers for protected parent methods ─────────────────────
-	// The upstream Installer declares these as protected (wizard-only access).
-	// We widen visibility to public so executeReset() can call them directly.
-
-	/**
-	 * Run the exact parent adminAccountSave — public wrapper only.
-	 * See vendor/Installer.php for the real implementation.
-	 */
-	public function adminAccountSave($wire) {
-		parent::adminAccountSave($wire);
-	}
-
-	// ── Reset-specific overrides ──────────────────────────────────────────
+	// ── Reset-specific overrides ──────────────────────────────────────────────
 
 	/**
 	 * getRemoveableItems — disabled for reset context.
 	 *
-	 * The real installer uses this to delete install.php, site/install/, and
-	 * other one-time-use files after a fresh install. During a reset those
-	 * files must be kept: they're the profile that the reset just consumed
-	 * and may be used again for subsequent resets.
+	 * The real installer uses this to delete install.php and site/install/ after
+	 * a fresh install. During a reset those files are the profile that was just
+	 * consumed and may be needed again for subsequent resets.
 	 */
 	public function getRemoveableItems($getMarkup = false, $removeNow = false) {
 		return $getMarkup ? '' : [];
@@ -113,33 +88,31 @@ class InstallerCore extends Installer {
 	/**
 	 * finish — path-corrected port of the original.
 	 *
-	 * The upstream version uses __DIR__ which resolves to our vendor/ folder
-	 * when the file is loaded from there. We use $config->paths->root instead
-	 * so site/install/finish.php (e.g. from site-default) is found correctly.
+	 * The upstream finish() uses __DIR__ which resolves to our vendor/ folder.
+	 * We use $config->paths->root so site/install/finish.php is found correctly.
 	 */
 	public function finish($wire, $user) {
 		$file = $wire->wire('config')->paths->root . 'site/install/finish.php';
 		if(is_file($file)) {
 			$fuel = array_merge($wire->wire('all')->getArray(), ['user' => $user]);
 			$installer = $this;
-			if($installer) {} // suppress "unused variable" notices
+			if($installer) {} // suppress "unused variable" notice
 			extract($fuel);
 			include($file);
 		}
 	}
 
 	/**
-	 * profileImportSQL — require_once fix for live-PW context.
+	 * profileImportSQL — public + require_once fix for live-PW context.
 	 *
-	 * The original does plain require("./wire/core/WireDatabaseBackup.php").
-	 * Inside a running ProcessWire instance WireDatabaseBackup is already
-	 * loaded, so a bare require() triggers "Cannot redeclare class". We guard
-	 * with class_exists() and use an absolute path via $config->paths->wire.
-	 * The rest of the method is identical to the upstream version.
+	 * The original is protected and does `require("./wire/core/WireDatabaseBackup.php")`.
+	 * Inside a running PW instance WireDatabaseBackup is already loaded, so a bare
+	 * require() triggers "Cannot redeclare class". We guard with class_exists() and
+	 * use an absolute path via $config->paths->wire. Everything else is identical.
 	 */
 	public function profileImportSQL($database, $file1, $file2, array $options = []) {
 		$defaults = [
-			'dbEngine' => 'InnoDB',
+			'dbEngine'  => 'InnoDB',
 			'dbCharset' => 'utf8mb4',
 		];
 		$options = array_merge($defaults, $options);
@@ -147,10 +120,10 @@ class InstallerCore extends Installer {
 
 		$restoreOptions = [];
 		$replace = [];
-		$replace['ENGINE=InnoDB'] = "ENGINE={$options['dbEngine']}";
-		$replace['ENGINE=MyISAM'] = "ENGINE={$options['dbEngine']}";
-		$replace['CHARSET=utf8mb4;'] = "CHARSET={$options['dbCharset']};";
-		$replace['CHARSET=utf8;'] = "CHARSET={$options['dbCharset']};";
+		$replace['ENGINE=InnoDB']        = "ENGINE={$options['dbEngine']}";
+		$replace['ENGINE=MyISAM']        = "ENGINE={$options['dbEngine']}";
+		$replace['CHARSET=utf8mb4;']     = "CHARSET={$options['dbCharset']};";
+		$replace['CHARSET=utf8;']        = "CHARSET={$options['dbCharset']};";
 		$replace['CHARSET=utf8 COLLATE='] = "CHARSET={$options['dbCharset']} COLLATE=";
 
 		if(strtolower($options['dbCharset']) === 'utf8mb4') {
@@ -163,8 +136,6 @@ class InstallerCore extends Installer {
 		}
 		if(count($replace)) $restoreOptions['findReplaceCreateTable'] = $replace;
 
-		// Fix: use require_once + absolute path (plain require() would cause
-		// "Cannot redeclare class WireDatabaseBackup" in a live PW instance)
 		if(!class_exists('\\ProcessWire\\WireDatabaseBackup', false)) {
 			require_once wire('config')->paths->wire . 'core/WireDatabaseBackup.php';
 		}
