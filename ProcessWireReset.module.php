@@ -211,6 +211,24 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$this->processPendingCustomTables($database);
 
 		$this->wire('user', $savedUser);
+
+		// Redirect back to admin once more so PW's SystemUpdater gets a clean
+		// request to finish any remaining core DB upgrades (e.g. field_admin_theme).
+		// Without this bounce, Update #10 runs on the same request as the login
+		// page, potentially leaving the form partially unstyled.
+		// Safe from infinite loops: pending file is already deleted above, so the
+		// module will not autoload on the next request and no redirect fires again.
+		$adminUrl = $this->safeRedirectUrl($this->wire('config')->urls->admin);
+		header("Location: $adminUrl");
+		header("Connection: close");
+		header("Content-Length: 0");
+		if(function_exists('fastcgi_finish_request')) {
+			fastcgi_finish_request();
+		} else {
+			while(ob_get_level() > 0) ob_end_clean();
+			flush();
+		}
+		exit;
 	}
 
 	/**
