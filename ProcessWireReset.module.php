@@ -747,26 +747,36 @@ HTMLMODAL;
 				$this->wire('log')->save('processwirereset', 'admin_theme skipped: ' . $e->getMessage());
 			}
 
-			// 2h. AdminThemeUikit — register with useAsLogin=1.
-			// The profile install.sql only seeds AdminThemeDefault, so Uikit is
-			// not in the fresh modules table. INSERT if missing, UPDATE if present.
+			// 2h. AdminThemeUikit — fully restore before redirect (synchronous, not deferred).
+			// The profile install.sql only seeds AdminThemeDefault, so Uikit is not in
+			// the fresh modules table. INSERT if missing, UPDATE if present.
+			// Backup data (flags + user settings) is merged in both branches so that
+			// writePendingInstalls can safely exclude AdminThemeUikit — there is no
+			// need for a deferred restore and deferring it would clobber useAsLogin=1.
 			try {
 				$stmt = $database->prepare("SELECT data, flags FROM modules WHERE class = 'AdminThemeUikit'");
 				$stmt->execute();
-				$row = $stmt->fetch(\PDO::FETCH_ASSOC);
+				$row    = $stmt->fetch(\PDO::FETCH_ASSOC);
+				$backup = $keptModuleData['AdminThemeUikit'] ?? null;
+
+				// Prefer backed-up user settings; fall back to fresh-DB data
+				if($backup && (string) $backup['data'] !== '') {
+					$d = json_decode($backup['data'], true);
+				} elseif($row && (string) $row['data'] !== '') {
+					$d = json_decode($row['data'], true);
+				} else {
+					$d = [];
+				}
+				if(!is_array($d)) $d = [];
+				$d['useAsLogin'] = 1;
 
 				if($row !== false) {
-					$d = ($row['data'] !== '' && $row['data'] !== null) ? json_decode($row['data'], true) : [];
-					if(!is_array($d)) $d = [];
-					$d['useAsLogin'] = 1;
-					$database->prepare("UPDATE modules SET data = :data WHERE class = 'AdminThemeUikit'")
-						->execute([':data' => json_encode($d)]);
+					$flags = $backup ? (int) $backup['flags'] : (int) $row['flags'];
+					$database->prepare(
+						"UPDATE modules SET data = :data, flags = :flags WHERE class = 'AdminThemeUikit'"
+					)->execute([':data' => json_encode($d), ':flags' => $flags]);
 				} else {
-					$backup = $keptModuleData['AdminThemeUikit'] ?? null;
-					$flags  = $backup ? (int) $backup['flags'] : 2;
-					$d      = ($backup && $backup['data'] !== '') ? json_decode($backup['data'], true) : [];
-					if(!is_array($d)) $d = [];
-					$d['useAsLogin'] = 1;
+					$flags = $backup ? (int) $backup['flags'] : 2;
 					$database->prepare(
 						"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
 					)->execute([':class' => 'AdminThemeUikit', ':flags' => $flags, ':data' => json_encode($d)]);
@@ -1127,9 +1137,13 @@ HTMLMODAL;
 	 */
 	protected function writePendingInstalls(array $keptModuleData, array $installOrder) {
 		$self    = $this->className();
+		// Core admin themes are fully restored synchronously in Phase 2h before the
+		// redirect. Deferring them would clobber useAsLogin=1 via the data-restore loop.
+		$syncClasses = ['AdminThemeUikit', 'AdminThemeDefault', 'AdminThemeReno'];
 		$pending = [];
 		foreach($installOrder as $className) {
 			if($className === $self) continue;
+			if(in_array($className, $syncClasses, true)) continue;
 			$item = ['class' => $className];
 			if(isset($keptModuleData[$className])) {
 				$item['flags'] = (int)    $keptModuleData[$className]['flags'];
