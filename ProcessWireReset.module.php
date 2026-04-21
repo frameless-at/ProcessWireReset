@@ -810,6 +810,14 @@ HTMLMODAL;
 			$this->writePendingCustomTables($customTables);
 			$this->writePendingInstalls($keptModuleData, $installOrder);
 
+			// 2k. Clear stale session throttle entries so the first post-reset
+			//     login is not blocked by counters from the pre-reset session.
+			try {
+				$database->exec("DELETE FROM session_login_throttle");
+			} catch(\Exception $e2) {
+				// table may not exist in older PW installs; ignore
+			}
+
 		} catch(\Exception $e) {
 			// Clean up half-written pending files so the next request doesn't
 			// try to install modules into an inconsistent DB state.
@@ -853,6 +861,14 @@ HTMLMODAL;
 		}
 
 		// ── Phase 4: Redirect ─────────────────────────────────────────────────
+		// Close the PHP session before redirecting. Without this, the browser's
+		// old session cookie arrives on the next request while the session lock
+		// is still held, which—with debug=true—produces "headers already sent"
+		// cascades and CSRF failures.
+		if(session_status() === PHP_SESSION_ACTIVE) {
+			session_write_close();
+		}
+
 		$adminUrl = $this->safeRedirectUrl($config->urls->admin);
 		header("Location: $adminUrl");
 		header("Connection: close");
