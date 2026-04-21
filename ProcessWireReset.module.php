@@ -160,21 +160,26 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 				try {
 					$modules->install($className);
-					$modules->refresh();
-					$installed[$className] = true;
-					$progress = true;
 				} catch(\Exception $e) {
 					$msg = $e->getMessage();
-					// Duplicate entry = auto-installed as dep → success
-					if(stripos($msg, 'Duplicate entry') !== false) {
+					// Check DB regardless — module may have been auto-installed
+					// as a dependency during install() before the exception fired.
+					$stmt2 = $database->prepare("SELECT id FROM modules WHERE class = :c");
+					$stmt2->execute([':c' => $className]);
+					if($stmt2->fetch()) {
+						// In DB = effectively installed (duplicate-entry or similar)
 						$installed[$className] = true;
 						$progress = true;
 						$modules->refresh();
 					} else {
-						$nextRemaining[]      = $className;
-						$failed[$className]   = $msg;
+						$nextRemaining[]    = $className;
+						$failed[$className] = $msg;
 					}
+					continue;
 				}
+				$modules->refresh();
+				$installed[$className] = true;
+				$progress = true;
 			}
 
 			$remaining = $nextRemaining;
@@ -1284,6 +1289,10 @@ HTMLMODAL;
 			foreach((array) ($info['installs'] ?? []) as $co) {
 				if(empty($co) || $co === $self) continue;
 				if(!isset($requires[$co])) $queue[] = $co;
+				// Treat 'installs' as a dependency edge: $className must come after $co
+				// so PW's auto-install during install($className) finds $co already
+				// installed and doesn't trigger a duplicate-entry DB error.
+				$deps[] = $co;
 			}
 			$requires[$className] = $deps;
 		}
