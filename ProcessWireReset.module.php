@@ -215,26 +215,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// Restore custom tables after all module installs
 		$this->processPendingCustomTables($database);
 
-		// Remove orphaned module entries: modules that a kept module's install()
-		// auto-installed into the DB, but whose class file was already deleted in
-		// Phase 3 (directory not in keepModuleDirs). PW's isInstalled() checks for
-		// both a DB entry AND a discoverable class file. Ghost entries (DB yes, file
-		// no) cause "Duplicate entry" errors when the user later manually installs
-		// any module that depends on the same class.
-		$modules->refresh();
-		try {
-			$allDbClasses = $database->query("SELECT class FROM modules")->fetchAll(\PDO::FETCH_COLUMN);
-			foreach($allDbClasses as $dbClass) {
-				if($dbClass === $this->className()) continue;
-				if($modules->getModuleFile($dbClass)) continue; // file found — OK
-				$database->prepare("DELETE FROM modules WHERE class = :c")->execute([':c' => $dbClass]);
-				$log->save('processwirereset', "Removed orphaned module entry (no file): $dbClass");
-			}
-			$modules->refresh();
-		} catch(\Exception $e) {
-			$log->save('processwirereset', 'Orphan cleanup failed: ' . $e->getMessage());
-		}
-
 		$this->wire('user', $savedUser);
 
 		// Redirect back to admin once more so PW's SystemUpdater gets a clean
