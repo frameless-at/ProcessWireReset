@@ -837,6 +837,37 @@ HTMLMODAL;
 		$this->fsFailures = [];
 		$keepDirPaths     = $this->parseKeepDirectories($keepDirectories, $sitePath);
 
+		// 3a. Sanitize $config->timezone in site/config.php.
+		// The original PW installer may have written a DST abbreviation like 'CEST'
+		// which PHP 8.x warns about. With debug=true the warning is emitted to the
+		// page body before session_start(), breaking sessions and causing CSRF failures.
+		// We resolve the abbreviation to a proper IANA identifier (e.g. Europe/Berlin)
+		// using PHP's own abbreviation map.
+		$configPhpPath = $sitePath . 'config.php';
+		if(is_readable($configPhpPath) && is_writable($configPhpPath)) {
+			$cfgContent = file_get_contents($configPhpPath);
+			if($cfgContent !== false &&
+			   preg_match('/\$config\s*->\s*timezone\s*=\s*[\'"]([^\'"]+)[\'"]/', $cfgContent, $tzMatch)) {
+				$currentTz = $tzMatch[1];
+				if(!in_array($currentTz, timezone_identifiers_list(), true)) {
+					// Resolve abbreviation (CEST → Europe/Berlin, etc.)
+					$abbrevs = \DateTimeZone::listAbbreviations();
+					$fixedTz = null;
+					if(isset($abbrevs[strtolower($currentTz)]) &&
+					   !empty($abbrevs[strtolower($currentTz)][0]['timezone_id'])) {
+						$fixedTz = $abbrevs[strtolower($currentTz)][0]['timezone_id'];
+					}
+					if(!$fixedTz) $fixedTz = 'UTC';
+					$cfgContent = preg_replace(
+						'/\$config\s*->\s*timezone\s*=\s*[\'"][^\'"]+[\'"]/',
+						"\$config->timezone = '$fixedTz'",
+						$cfgContent
+					);
+					file_put_contents($configPhpPath, $cfgContent);
+				}
+			}
+		}
+
 		$this->cleanAssetsDirectory($sitePath . 'assets/', $keepDirPaths);
 
 		$this->emptyDirectory($sitePath . 'templates/', $keepDirPaths);
