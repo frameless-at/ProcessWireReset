@@ -37,8 +37,8 @@ pristine install.
 **Action:**
 1. Open **Modules → Configure → ProcessWire Reset**
 2. Do NOT select any modules to keep
-3. Type `RESET` in the confirmation field
-4. Click **Reset Installation**
+3. Tick **I want to reset this installation** and submit the form
+4. In the confirmation modal, click **Execute Reset**
 
 **Expected:**
 - Redirect to admin login at `/processwire/`
@@ -74,7 +74,7 @@ SELECT class FROM modules WHERE class = 'ProcessWireReset';  -- exists
 **Action:**
 1. Open the config screen
 2. Select the test module in the AsmSelect
-3. Confirm with `RESET` and click **Reset Installation**
+3. Tick the reset checkbox, submit, and confirm with **Execute Reset** in the modal
 
 **Expected:**
 - After redirect + login, the test module is still installed
@@ -398,8 +398,8 @@ ls -la site/modules/ProcessWireReset/.pending-*
 1. Open the config screen (saved config shows SomeModule selected in AsmSelect)
 2. Deselect SomeModule in the AsmSelect (visual change only)
 3. Do NOT click the main Submit button
-4. Type `RESET` in the confirmation field
-5. Click **Reset Installation**
+4. Tick the reset checkbox and submit the form
+5. Confirm with **Execute Reset** in the modal
 
 **Expected:**
 - Reset treats this as "keep nothing" — POST values are authoritative

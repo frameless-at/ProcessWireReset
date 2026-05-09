@@ -64,8 +64,8 @@ when its config screen is opened or when a pending install needs processing.
 3. (Optional) Select **Modules to Keep** in the AsmSelect. Transitive
    dependencies are automatically included — if you select Module A which
    requires B which requires C, all three are preserved.
-4. Type **`RESET`** in the Confirmation field
-5. Click **Reset Installation**
+4. Tick **I want to reset this installation** and submit the form
+5. A confirmation modal opens — review the summary and click **Execute Reset**
 
 The reset runs, the page redirects to the admin login, and on the next admin
 request the deferred install kicks in to restore the kept modules.
@@ -131,7 +131,9 @@ using PHP's `crypt()` with the site's `$config->userAuthSalt`.
 
 - The module is non-autoload by default and only acts on POST submissions to
   its own config form
-- POST requests require the literal text `RESET` as confirmation
+- The reset is gated by a JavaScript-driven confirmation modal that only
+  submits after explicit user confirmation; the server additionally requires
+  a hidden `confirmReset` token in the POST payload
 - Custom profile paths are validated via `realpath()` against the PW root
 - The redirect URL is validated to prevent open-redirect / header injection
 - Output errors during the destructive phase are suppressed to prevent
