@@ -1614,16 +1614,11 @@ HTMLMODAL;
 	 * after pruning already-restored tables out of the payload.
 	 */
 	protected function writeCustomTablesSnapshotPayload(array $payload) {
-		$file    = __DIR__ . '/' . self::SNAPSHOT_FILE;
-		$encoded = base64_encode(serialize($payload));
-		$body    = "<?php http_response_code(403); exit; ?>\n"
-			. "==SNAPSHOT BEGIN==\n"
-			. $encoded . "\n"
-			. "==SNAPSHOT END==\n";
-		if(file_put_contents($file, $body, LOCK_EX) === false) {
-			throw new WireException("Cannot write custom-tables snapshot: $file");
-		}
-		@chmod($file, 0600);
+		$this->writeWrappedFile(
+			__DIR__ . '/' . self::SNAPSHOT_FILE,
+			base64_encode(serialize($payload)),
+			'SNAPSHOT'
+		);
 	}
 
 	/**
@@ -1631,16 +1626,12 @@ HTMLMODAL;
 	 * or the unserialized payload array on success.
 	 */
 	protected function readCustomTablesSnapshot() {
-		$file = __DIR__ . '/' . self::SNAPSHOT_FILE;
-		if(!is_file($file)) return null;
-		$raw = (string) @file_get_contents($file);
-		if($raw === '') return null;
-		$parts = explode('==SNAPSHOT BEGIN==', $raw);
-		if(count($parts) < 2) return null;
-		$body = $parts[1];
-		$end  = strpos($body, '==SNAPSHOT END==');
-		if($end === false) return null;
-		$payload = @unserialize((string) base64_decode(trim(substr($body, 0, $end)), true), ['allowed_classes' => false]);
+		$encoded = $this->readWrappedFile(
+			__DIR__ . '/' . self::SNAPSHOT_FILE,
+			'SNAPSHOT'
+		);
+		if($encoded === null) return null;
+		$payload = @unserialize((string) base64_decode($encoded, true), ['allowed_classes' => false]);
 		return is_array($payload) && !empty($payload['tables']) ? $payload : null;
 	}
 
@@ -2179,6 +2170,39 @@ HTMLMODAL;
 	// =========================================================================
 
 	/**
+	 * Write a base64-encoded payload between identical markers inside a
+	 * PHP-wrapped file. The wrapper sends 403 on direct HTTP access, the
+	 * markers make extraction trivial regardless of where the payload
+	 * sits in the file.
+	 *
+	 * Used by writeRecoveryState() and writeCustomTablesSnapshotPayload().
+	 */
+	protected function writeWrappedFile($path, $encoded, $marker) {
+		$body = "<?php http_response_code(403); exit; ?>\n"
+			. "==$marker==\n"
+			. $encoded . "\n"
+			. "==$marker==\n";
+		if(file_put_contents($path, $body, LOCK_EX) === false) {
+			throw new WireException("Could not write state file: $path");
+		}
+		@chmod($path, 0600);
+	}
+
+	/**
+	 * Read a wrapped file back out and return the encoded payload string,
+	 * or null if the file is missing / malformed. Decoding (base64,
+	 * json/serialize) is left to the caller.
+	 */
+	protected function readWrappedFile($path, $marker) {
+		if(!is_file($path)) return null;
+		$raw = (string) @file_get_contents($path);
+		if($raw === '') return null;
+		$parts = explode("==$marker==", $raw);
+		if(count($parts) < 3) return null;
+		return trim($parts[1]);
+	}
+
+	/**
 	 * Write the recovery state file used by repair.php to perform a
 	 * standard install with the original superuser credentials if the
 	 * current reset crashes.
@@ -2198,17 +2222,11 @@ HTMLMODAL;
 			'core_sql'    => (string) $coreSQL,
 			'profile_sql' => (string) $profileSQL,
 		];
-		$encoded = base64_encode((string) json_encode($payload));
-		$body    = "<?php http_response_code(403); exit; ?>\n"
-			. "==RECOVERY-STATE==\n"
-			. $encoded . "\n"
-			. "==RECOVERY-STATE==\n";
-
-		$path = __DIR__ . '/' . self::RECOVERY_STATE_FILE;
-		if(file_put_contents($path, $body, LOCK_EX) === false) {
-			throw new WireException("Could not write recovery state file: $path");
-		}
-		@chmod($path, 0600);
+		$this->writeWrappedFile(
+			__DIR__ . '/' . self::RECOVERY_STATE_FILE,
+			base64_encode((string) json_encode($payload)),
+			'RECOVERY-STATE'
+		);
 	}
 
 	/**
