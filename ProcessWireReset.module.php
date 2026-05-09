@@ -111,6 +111,14 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		if(!file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) return;
 
+		// Banner only appears until the user has restored anything from
+		// the snapshot at least once. After that it stays out of the way
+		// even if there are still un-restored tables — the user might be
+		// deliberately ignoring them. The full restore UI remains
+		// accessible from Modules → Configure → ProcessWire Reset.
+		$snapshot = $this->readCustomTablesSnapshot();
+		if(!empty($snapshot['acknowledged'])) return;
+
 		$out = (string) $event->return;
 		// Only touch real HTML responses — skip AJAX / fragment / file
 		// downloads where there is no <body> to inject into.
@@ -475,15 +483,18 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 						$this->_n('Restored %d table: %s', 'Restored %d tables: %s', count($restored)),
 						count($restored), implode(', ', $restored)
 					));
-					// Drop restored tables from the snapshot so the banner
-					// reflects what's actually still available. Snapshot file
-					// is removed entirely once empty so the banner disappears.
+					// Drop restored tables from the snapshot. Mark the
+					// snapshot as acknowledged so the admin banner stops
+					// reappearing — even if the user deliberately left some
+					// tables behind. The snapshot itself stays available
+					// from the module config screen for later cleanup.
 					foreach($restored as $tableName) {
 						unset($payload['tables'][$tableName]);
 					}
 					if(empty($payload['tables'])) {
 						$this->deleteCustomTablesSnapshot();
 					} else {
+						$payload['acknowledged'] = true;
 						$this->writeCustomTablesSnapshotPayload($payload);
 					}
 				}
