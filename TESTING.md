@@ -665,6 +665,65 @@ tables remain in the snapshot.
 
 ---
 
+## S22 — Directories to keep
+
+**Goal:** Verify that paths listed in *Directories to keep* survive
+the filesystem cleanup phase, that comments and empty lines are
+ignored, and that the parent-path protection works (a deep path also
+keeps every directory above it inside `site/`).
+
+**Preconditions:**
+
+- Known-state PW installation.
+- Create three test directories with marker files:
+  ```
+  site/assets/preserve-me/marker.txt          ← content: "kept-A"
+  site/assets/uploads/legacy/old.txt          ← content: "kept-B"
+  site/assets/uploads/temp/throwaway.txt      ← content: "wiped-C"
+  site/templates/RockIcons/icons.svg          ← content: "kept-D"
+  ```
+- ProcessWireReset config: empty `keepModules`, empty `profilePath`.
+
+**Action:**
+
+1. Open the config screen and paste into *Directories to keep*:
+   ```
+   # this comment must be ignored
+   assets/preserve-me
+
+   # deep path — parent must survive too
+   assets/uploads/legacy
+
+   templates/RockIcons
+   ```
+2. Save the form, then trigger a reset (no kept modules).
+3. Log back in.
+
+**Expected:**
+
+- `site/assets/preserve-me/marker.txt` still exists (verbatim, content
+  `"kept-A"`).
+- `site/assets/uploads/legacy/old.txt` still exists (`"kept-B"`).
+- `site/assets/uploads/` itself still exists — it's the parent of a
+  kept path, so the cleanup did not delete it on the way to wiping
+  unrelated siblings.
+- `site/assets/uploads/temp/throwaway.txt` is **gone**, and the
+  `temp/` directory is gone too — sibling-level paths are not protected
+  by the keep entry on `legacy/`.
+- `site/templates/RockIcons/icons.svg` still exists (`"kept-D"`).
+- Other untouched parts of `site/templates/` are reset to the profile
+  state (no leftover sentinels from before).
+- The reset completes normally; no errors in the log.
+
+**Negative checks:**
+
+- An entry of just `#` or whitespace must not crash the parser.
+- An entry of `..` or `../somewhere` must not break out of `site/`
+  (the parser strips leading `site/` and trims slashes; absolute
+  paths above `site/` cannot be specified).
+
+---
+
 ## Test matrix
 
 | Scenario | Critical path coverage                                         |
@@ -690,6 +749,7 @@ tables remain in the snapshot.
 | S19      | Snapshot banner auto-dismiss on first restore                  |
 | S20      | Snapshot delete                                                |
 | S21      | Recovery endpoint auto-deploy + diagnostic mode                |
+| S22      | Directories to keep (filesystem allowlist + parent protection) |
 
 ## Minimum smoke test
 

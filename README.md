@@ -25,7 +25,9 @@ afterwards.
   config) for a new project without redoing the install dance —
   reset to a fresh profile and start over.
 - **Cleanup after stress / load tests.** Drop the bulk pages, files
-  and modules a test run created and return to a baseline.
+  and modules a test run created and return to a baseline. Use
+  *Directories to keep* to spare specific asset folders that should
+  survive (e.g. `assets/uploads/seed/` with reusable fixture files).
 
 The reset is useful any time "uninstall everything except my
 superuser and these N modules, then start fresh" describes the goal
@@ -52,8 +54,10 @@ A reset performs the following steps in order:
    merged with the configured profile's `install.sql`.
 5. Restores the superuser account into the freshly imported tables.
 6. Empties `site/assets/files/`, `assets/cache/`, `assets/logs/` and
-   `assets/sessions/`.
-7. Resets `site/templates/` to the profile state.
+   `assets/sessions/` — anything listed in *Directories to keep* is
+   skipped, including its parent path so the surrounding tree survives.
+7. Resets `site/templates/` to the profile state, again honouring
+   *Directories to keep*.
 8. Removes everything from `site/modules/` except `ProcessWireReset` itself
    and the kept modules.
 9. Writes a deferred-install pending file containing kept modules in
@@ -105,8 +109,11 @@ processing, or when an unrestored snapshot exists (so it can show the banner).
 3. (Optional) Select **Modules to Keep** in the AsmSelect. Transitive
    dependencies are automatically included — if you select Module A which
    requires B which requires C, all three are preserved.
-4. Tick **I want to reset this installation** and submit the form.
-5. A confirmation modal opens. Inspect the summary, copy the recovery URL
+4. (Optional) List paths under **Directories to keep** (one per line,
+   relative to `site/`) that should survive the filesystem cleanup.
+   See [Directories to keep](#directories-to-keep) for the rules.
+5. Tick **I want to reset this installation** and submit the form.
+6. A confirmation modal opens. Inspect the summary, copy the recovery URL
    (single-use, shown only once), tick **I saved the recovery URL**, and
    click **Execute Reset**.
 
@@ -137,6 +144,45 @@ The module will:
 
 If no custom path is set, the module uses its bundled defaults under
 `install/install.sql` and `install/site-templates/`.
+
+## Directories to keep
+
+The filesystem cleanup phase (Phase 3) wipes `site/assets/{files,cache,
+logs,sessions}/` and resets `site/templates/`. Anything listed in the
+*Directories to keep* textarea on the module config screen is exempt
+from that cleanup.
+
+**Format:**
+
+- One path per line, relative to `site/`. Leading `site/` and surrounding
+  slashes are tolerated.
+- Lines starting with `#` are treated as comments and ignored.
+- Empty lines are ignored.
+
+**Examples:**
+
+```
+# Keep an addon's template assets
+templates/RockIcons
+
+# Keep TracyDebugger's cache (if you keep the module too)
+assets/TracyDebugger
+
+# Keep ProcessDatabaseBackups dump dir
+assets/backups
+```
+
+**Behaviour notes:**
+
+- Both the listed path **and every parent of it** are kept. Listing
+  `assets/uploads/legacy/` therefore prevents `assets/uploads/` from
+  being emptied — otherwise the parent would be wiped before the
+  protection on the child could trigger.
+- The check is path-prefix-based; sibling directories are not affected.
+  Listing `templates/RockIcons` keeps that exact subtree but other
+  directories under `templates/` are still reset to the profile state.
+- Paths outside `site/` cannot be specified — the textarea is rooted
+  at the site directory.
 
 ## How modules and data are preserved
 
