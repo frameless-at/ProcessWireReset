@@ -119,51 +119,53 @@ function repair_fail($msg, $code = 403) {
 }
 
 function repair_diagnose($statePath, $configPhp, $wireDir) {
-	$h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
-	$row = function($k, $v, $cls = '') use ($h) {
-		return '<tr><th>' . $h($k) . '</th><td' . ($cls ? ' class="' . $cls . '"' : '') . '>' . $v . '</td></tr>';
+	// repair.php sits in the document root and is reachable by anyone,
+	// authenticated or not. The diagnostic must therefore leak nothing
+	// useful for reconnaissance: no absolute paths, no PHP version, no
+	// usernames, no existence-checks against internal PW files. Only
+	// booleans, only when a recovery is actually in progress.
+	$h   = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
+	$row = function($k, $v) use ($h) {
+		return '<tr><th>' . $h($k) . '</th><td>' . $v . '</td></tr>';
 	};
-	$yn  = function($b) { return $b ? '<span class="ok">yes</span>' : '<span class="err">no</span>'; };
+	$yn = function($b) { return $b ? '<span class="ok">yes</span>' : '<span class="err">no</span>'; };
 
-	$rows = '';
-	$rows .= $row('Script reachable', '<span class="ok">yes (you would not see this otherwise)</span>');
-	$rows .= $row('repair.php path', $h(__FILE__));
-	$rows .= $row('PHP version', $h(PHP_VERSION));
+	$intro = '<p>Recovery endpoint reachable. Append <code>?token=YOUR_TOKEN</code> to invoke recovery.</p>';
 
-	$stateExists = is_file($statePath);
-	$rows .= $row('recovery.state.php exists', $yn($stateExists));
-	$rows .= $row('recovery.state.php path', $h($statePath));
+	if(!is_file($statePath)) {
+		// No active recovery — nothing to disclose.
+		repair_response(200, 'Recovery endpoint',
+			$intro . '<p>No recovery is currently in progress.</p>'
+		);
+	}
 
-	if($stateExists) {
-		$readable = is_readable($statePath);
-		$rows .= $row('recovery.state.php readable', $yn($readable));
-		if($readable) {
-			$raw   = (string) @file_get_contents($statePath);
-			$parts = explode('==RECOVERY-STATE==', $raw);
-			$wellFormed = count($parts) >= 3;
-			$rows .= $row('state file format markers found', $yn($wellFormed));
-			if($wellFormed) {
-				$payload = @json_decode((string) base64_decode(trim($parts[1]), true), true);
-				$valid   = is_array($payload) && !empty($payload['token_hash']) && !empty($payload['superuser']);
-				$rows .= $row('state payload decodes', $yn($valid));
-				if($valid) {
-					$exp     = (int) ($payload['expires_at'] ?? 0);
-					$expired = $exp > 0 && time() > $exp;
-					$rows .= $row('expires_at', $h(date('c', $exp)) . ($expired ? ' <span class="err">(EXPIRED)</span>' : ' <span class="ok">(valid)</span>'));
-					$rows .= $row('superuser name', $h((string) ($payload['superuser']['name'] ?? '?')));
-					$rows .= $row('core_sql exists', $yn(is_file((string) ($payload['core_sql'] ?? ''))));
-					$rows .= $row('profile_sql exists', $yn(is_file((string) ($payload['profile_sql'] ?? ''))));
-				}
-			}
+	// Active recovery — show booleans about the state file only. Anybody
+	// hitting this page already knows a reset has happened (the
+	// confirmation modal showed them the URL); confirming the abstract
+	// shape of the state file does not give an attacker anything new.
+	$rows = $row('Recovery in progress', $yn(true));
+
+	$raw        = (string) @file_get_contents($statePath);
+	$parts      = explode('==RECOVERY-STATE==', $raw);
+	$wellFormed = count($parts) >= 3;
+	$rows .= $row('State file format ok', $yn($wellFormed));
+
+	if($wellFormed) {
+		$payload = @json_decode((string) base64_decode(trim($parts[1]), true), true);
+		$valid   = is_array($payload) && !empty($payload['token_hash']) && !empty($payload['superuser']);
+		$rows .= $row('State payload decodes', $yn($valid));
+		if($valid) {
+			$exp     = (int) ($payload['expires_at'] ?? 0);
+			$expired = $exp > 0 && time() > $exp;
+			$rows .= $row('Token still valid', $expired
+				? '<span class="err">no (expired)</span>'
+				: '<span class="ok">yes</span>');
 		}
 	}
 
-	$rows .= $row('config.php exists', $yn(is_file($configPhp)));
-	$rows .= $row('wire/core/WireDatabaseBackup.php exists', $yn(is_file($wireDir . '/core/WireDatabaseBackup.php')));
-
-	$body = '<p>Diagnostic mode (no <code>?token=</code> in URL). Append <code>?token=YOUR_TOKEN</code> to actually run the recovery.</p>'
-		. '<table>' . $rows . '</table>';
-	repair_response(200, 'Recovery diagnostic', $body);
+	repair_response(200, 'Recovery endpoint',
+		$intro . '<table>' . $rows . '</table>'
+	);
 }
 
 // ─── 1. Token & state file ───────────────────────────────────────────────
