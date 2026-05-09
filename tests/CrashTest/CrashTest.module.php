@@ -5,32 +5,35 @@
  *
  * DO NOT INSTALL IN PRODUCTION.
  *
- * The first install() completes normally so the module can be enabled
- * via Modules → Refresh → Install and selected as a "Keep Module" in
- * ProcessWireReset's config. After arming (touch a marker file), the
- * NEXT install() — i.e. the deferred re-install that runs at the end
- * of a reset via processPendingInstalls() — throws.
+ * The first install() runs cleanly and writes a marker file in the
+ * module directory. The marker arms the trigger: on the NEXT
+ * install() — i.e. the deferred re-install run by
+ * processPendingInstalls() at the end of a reset — install() consumes
+ * the marker and throws.
  *
  * That throw aborts the deferred-install loop, cleanupRecoveryState()
- * is never reached, recovery.state.php stays on disk, and the recovery
- * URL captured from the confirmation modal can be used to invoke
- * repair.php.
+ * is never reached, recovery.state.php stays on disk, and the
+ * recovery URL captured from the confirmation modal can be used to
+ * invoke repair.php.
  *
- * Usage:
+ * Marker is consumed on the failing call so a fresh UI install after
+ * recovery succeeds again (and re-arms automatically).
+ *
+ * Usage (no CLI required):
  *   1. Copy `tests/CrashTest/` → `site/modules/CrashTest/`
  *   2. Modules → Refresh → install "Crash Test"
- *      (first install() runs cleanly, module appears in the modules list)
- *   3. Arm the trigger:
- *        touch site/modules/CrashTest/.crash-on-reinstall
- *   4. ProcessWire Reset → Configure → tick CrashTest under
+ *      (first install() runs cleanly and arms the trigger)
+ *   3. ProcessWire Reset → Configure → tick CrashTest under
  *      "Modules to keep" → trigger the reset
- *   5. Copy the recovery URL from the modal, confirm, execute
- *   6. After redirect, the deferred re-install will throw — the
+ *   4. Copy the recovery URL from the modal, confirm, execute
+ *   5. After redirect, the deferred re-install will throw and the
  *      recovery URL now resolves cleanly via repair.php
  *
- * Disarm/cleanup:
- *   - Remove the marker:  rm site/modules/CrashTest/.crash-on-reinstall
- *   - Remove the module:  rm -rf site/modules/CrashTest
+ * To re-run the test after recovery: Modules → Refresh → install
+ * Crash Test again. The marker is gone (consumed during the crash),
+ * so the install succeeds and re-arms.
+ *
+ * Cleanup: uninstall via Modules screen, or remove the directory.
  */
 class CrashTest extends WireData implements Module {
 
@@ -40,18 +43,30 @@ class CrashTest extends WireData implements Module {
 		return [
 			'title'    => 'Crash Test (ProcessWireReset test helper)',
 			'version'  => '0.0.1',
-			'summary'  => 'Throws on re-install when armed. Use only for testing repair.php.',
+			'summary'  => 'First install arms a trigger; next install throws. Test helper for repair.php.',
 			'autoload' => false,
 			'singular' => true,
 		];
 	}
 
 	public function install() {
-		if(is_file(__DIR__ . '/' . self::ARM_MARKER)) {
+		$marker = __DIR__ . '/' . self::ARM_MARKER;
+		if(is_file($marker)) {
+			// Consume the marker so a manual re-install via the modules
+			// screen after a successful recovery works without leftover state.
+			@unlink($marker);
 			throw new WireException(
-				'CrashTest: armed re-install crash (repair.php test). '
-				. 'Delete ' . self::ARM_MARKER . ' to disarm.'
+				'CrashTest: armed re-install crash for repair.php testing.'
 			);
 		}
+		// First install on this filesystem copy — arm for the next call.
+		@file_put_contents($marker, "Armed by CrashTest::install(); will trigger on next install().\n");
+	}
+
+	public function uninstall() {
+		// Defensive: if the user uninstalls before triggering the crash,
+		// don't leave an armed marker behind that would break a later
+		// fresh install.
+		@unlink(__DIR__ . '/' . self::ARM_MARKER);
 	}
 }

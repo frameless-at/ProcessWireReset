@@ -464,15 +464,11 @@ can recover from a crash inside the deferred-install phase by invoking
 `repair.php` and producing a working clean install with the original
 superuser credentials.
 
-**Setup:**
+**Setup (no CLI required):**
 - Copy `tests/CrashTest/` into `site/modules/CrashTest/`
 - Modules → Refresh → install **Crash Test**
-  (the first `install()` completes normally so the module can be picked
-  in the AsmSelect)
-- Arm the crash trigger:
-  `touch site/modules/CrashTest/.crash-on-reinstall`
-  (the file's presence makes the next `install()` throw — exactly what
-  `processPendingInstalls()` will try after the reset)
+  (the first `install()` completes normally and silently arms the
+  crash trigger for the next call)
 - ProcessWire Reset → Configure → select `CrashTest` under
   *Modules to keep*
 
@@ -513,12 +509,15 @@ superuser credentials.
 - Calling 24 h after the reset (TTL expiry) → 403, state file is
   auto-deleted on the failed verify attempt
 
+**Re-running the test:**
+- After a successful recovery, the marker has been consumed by the
+  crashing `install()` call. To run S17 again: Modules → Refresh →
+  install **Crash Test** once more. The fresh install re-arms the
+  trigger automatically.
+
 **Cleanup:**
-- Remove the arm marker: `rm site/modules/CrashTest/.crash-on-reinstall`
-  (this also lets you re-run S17 from step 4 without redeploying the
-  module)
-- Remove the test module entirely once done:
-  `rm -rf site/modules/CrashTest`
+- Modules → uninstall **Crash Test** (the uninstall hook also clears
+  any leftover marker), then delete `site/modules/CrashTest/`
 
 ---
 
