@@ -457,6 +457,61 @@ that would block a subsequent recovery from a database backup.
 
 ---
 
+## S17 — Recovery via repair.php (token-gated standard install)
+
+**Goal:** Verify that the recovery URL captured in the confirmation modal
+can recover from a crash inside the deferred-install phase by invoking
+`repair.php` and producing a working clean install with the original
+superuser credentials.
+
+**Setup:**
+- Copy `tests/CrashTest/` into `site/modules/CrashTest/`
+- Modules → Refresh → install **Crash Test**
+- ProcessWire Reset → Configure → select `CrashTest` under
+  *Modules to keep*
+
+**Action:**
+1. Trigger the reset (tick the enable checkbox, submit)
+2. In the confirmation modal:
+   - Click the copy icon next to the recovery URL
+   - Paste it somewhere outside the browser (sticky note, password
+     manager, second tab — anywhere it survives a PW outage)
+   - Tick **I saved the recovery URL**
+3. Click **Execute Reset**
+4. After redirect, observe that the admin login is broken / the next
+   request fails — `processPendingInstalls()` re-tries `CrashTest::install()`
+   which throws
+
+**Expected (failure phase):**
+- `recovery.state.php` exists in `site/modules/ProcessWireReset/`
+- `.pending-installs.json` also still exists (cleanup not reached)
+- Direct HTTP access to `recovery.state.php` returns 403 (`<?php exit;` wrapper)
+
+**Action — recovery:**
+5. Open the saved recovery URL in a browser
+
+**Expected (recovery phase):**
+- `repair.php` returns a 200 success page with a "Continue to login" link
+- The page text confirms "clean default install … original superuser
+  credentials"
+- `recovery.state.php`, `.pending-installs.json`,
+  `.pending-custom-tables.bin` are all gone afterwards
+- Login works with the **pre-reset** username + password
+- The admin shows the bundled `site-blank` profile (no CrashTest, no
+  other custom modules — by design)
+
+**Negative checks (defense):**
+- Calling `repair.php` without `?token=` → 403, no state file changes
+- Calling with a wrong token → 403 with ~500ms artificial delay
+- Calling after success → 403 ("no recovery state available")
+- Calling 24 h after the reset (TTL expiry) → 403, state file is
+  auto-deleted on the failed verify attempt
+
+**Cleanup:**
+- Remove `site/modules/CrashTest/` after the test
+
+---
+
 ## Test matrix
 
 | Scenario | Critical path coverage                                  |
@@ -477,6 +532,7 @@ that would block a subsequent recovery from a database backup.
 | S14      | POST-authoritative keepModules (regression)             |
 | S15      | Performance under load                                  |
 | S16      | Error recovery from database backup                     |
+| S17      | Recovery via repair.php (token-gated standard install)  |
 
 ## Minimum smoke test
 
