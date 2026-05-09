@@ -467,6 +467,12 @@ superuser credentials.
 **Setup:**
 - Copy `tests/CrashTest/` into `site/modules/CrashTest/`
 - Modules → Refresh → install **Crash Test**
+  (the first `install()` completes normally so the module can be picked
+  in the AsmSelect)
+- Arm the crash trigger:
+  `touch site/modules/CrashTest/.crash-on-reinstall`
+  (the file's presence makes the next `install()` throw — exactly what
+  `processPendingInstalls()` will try after the reset)
 - ProcessWire Reset → Configure → select `CrashTest` under
   *Modules to keep*
 
@@ -479,8 +485,8 @@ superuser credentials.
    - Tick **I saved the recovery URL**
 3. Click **Execute Reset**
 4. After redirect, observe that the admin login is broken / the next
-   request fails — `processPendingInstalls()` re-tries `CrashTest::install()`
-   which throws
+   request fails — `processPendingInstalls()` re-runs `CrashTest::install()`,
+   which throws because the arm marker survived in the kept module dir
 
 **Expected (failure phase):**
 - `recovery.state.php` exists in `site/modules/ProcessWireReset/`
@@ -508,7 +514,11 @@ superuser credentials.
   auto-deleted on the failed verify attempt
 
 **Cleanup:**
-- Remove `site/modules/CrashTest/` after the test
+- Remove the arm marker: `rm site/modules/CrashTest/.crash-on-reinstall`
+  (this also lets you re-run S17 from step 4 without redeploying the
+  module)
+- Remove the test module entirely once done:
+  `rm -rf site/modules/CrashTest`
 
 ---
 

@@ -5,45 +5,53 @@
  *
  * DO NOT INSTALL IN PRODUCTION.
  *
- * Throws inside install(), which is exactly what processPendingInstalls()
- * runs at the end of a reset to restore kept modules. With this module
- * selected as "Keep Module", a reset will:
+ * The first install() completes normally so the module can be enabled
+ * via Modules → Refresh → Install and selected as a "Keep Module" in
+ * ProcessWireReset's config. After arming (touch a marker file), the
+ * NEXT install() — i.e. the deferred re-install that runs at the end
+ * of a reset via processPendingInstalls() — throws.
  *
- *   1. Wipe the database.
- *   2. Re-import core + profile install.sql.
- *   3. Restore the superuser.
- *   4. Redirect to the admin login.
- *   5. On the next request, processPendingInstalls() tries to re-install
- *      this module and throws → cleanupRecoveryState() is NOT reached →
- *      recovery.state.php stays on disk → the recovery URL captured
- *      from the confirmation modal works against repair.php.
+ * That throw aborts the deferred-install loop, cleanupRecoveryState()
+ * is never reached, recovery.state.php stays on disk, and the recovery
+ * URL captured from the confirmation modal can be used to invoke
+ * repair.php.
  *
  * Usage:
- *   1. Copy the parent directory (`tests/CrashTest/`) into
- *      `site/modules/CrashTest/`.
- *   2. Modules → Refresh → install "Crash Test".
- *   3. ProcessWire Reset → Configure → tick CrashTest under
- *      "Modules to keep" → trigger the reset.
- *   4. Copy the recovery URL shown in the confirmation modal.
- *   5. Confirm + execute. After redirect, the deferred install will fail.
- *   6. Open the recovery URL → repair.php performs a clean default
- *      install with the original superuser credentials.
+ *   1. Copy `tests/CrashTest/` → `site/modules/CrashTest/`
+ *   2. Modules → Refresh → install "Crash Test"
+ *      (first install() runs cleanly, module appears in the modules list)
+ *   3. Arm the trigger:
+ *        touch site/modules/CrashTest/.crash-on-reinstall
+ *   4. ProcessWire Reset → Configure → tick CrashTest under
+ *      "Modules to keep" → trigger the reset
+ *   5. Copy the recovery URL from the modal, confirm, execute
+ *   6. After redirect, the deferred re-install will throw — the
+ *      recovery URL now resolves cleanly via repair.php
  *
- * Remove this module from `site/modules/` afterwards.
+ * Disarm/cleanup:
+ *   - Remove the marker:  rm site/modules/CrashTest/.crash-on-reinstall
+ *   - Remove the module:  rm -rf site/modules/CrashTest
  */
 class CrashTest extends WireData implements Module {
+
+	const ARM_MARKER = '.crash-on-reinstall';
 
 	public static function getModuleInfo() {
 		return [
 			'title'    => 'Crash Test (ProcessWireReset test helper)',
 			'version'  => '0.0.1',
-			'summary'  => 'Throws on install(). Use only for testing repair.php.',
+			'summary'  => 'Throws on re-install when armed. Use only for testing repair.php.',
 			'autoload' => false,
 			'singular' => true,
 		];
 	}
 
 	public function install() {
-		throw new WireException('CrashTest: intentional install() failure for repair.php testing.');
+		if(is_file(__DIR__ . '/' . self::ARM_MARKER)) {
+			throw new WireException(
+				'CrashTest: armed re-install crash (repair.php test). '
+				. 'Delete ' . self::ARM_MARKER . ' to disarm.'
+			);
+		}
 	}
 }
