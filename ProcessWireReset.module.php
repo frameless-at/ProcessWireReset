@@ -124,11 +124,11 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// downloads where there is no <body> to inject into.
 		if(stripos($out, '<body') === false) return;
 
-		$h        = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
-		$editUrl  = $h($this->wire('config')->urls->admin . 'module/edit?name=' . $this->className());
-		$title    = $h($this->_('Database snapshot available'));
-		$body     = $h($this->_('A reset created a backup of non-canonical tables.'));
-		$btnLabel = $h($this->_('Review &amp; restore'));
+		$h         = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
+		$editUrl   = $h($this->wire('config')->urls->admin . 'module/edit?name=' . $this->className());
+		$title     = $h($this->_('Database snapshot available'));
+		$body      = $h($this->_('A reset created a backup of non-canonical tables.'));
+		$linkLabel = $h($this->_('Review & restore'));
 
 		// UIkit-flavoured (AdminThemeUikit). Falls back gracefully on other
 		// themes — without UIkit the alert just renders as a plain block,
@@ -136,11 +136,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$banner = '<div id="pwreset-snapshot-banner" class="uk-alert uk-alert-warning"'
 			. ' style="margin:0;border-radius:0;padding:.6em 1.5em;'
 			. 'display:flex;align-items:center;gap:1em;flex-wrap:wrap;">'
-			. '<span uk-icon="icon: database" class="uk-margin-small-right"></span>'
+			. '<span uk-icon="icon: database"></span>'
 			. '<strong>' . $title . '</strong>'
-			. '<span class="uk-flex-1" style="flex:1">' . $body . '</span>'
-			. '<a class="uk-button uk-button-primary uk-button-small"'
-			. ' href="' . $editUrl . '">' . $btnLabel . '</a>'
+			. '<span style="flex:1">' . $body . '</span>'
+			. '<a href="' . $editUrl . '">' . $linkLabel . '</a>'
 			. '</div>';
 
 		$event->return = preg_replace('/(<body\b[^>]*>)/i', '$1' . $banner, $out, 1);
