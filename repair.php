@@ -199,24 +199,32 @@ if($token === '') {
 // progress text + the shutdown trap above is what the user sees.
 header('Content-Type: text/html; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate');
+header('X-Accel-Buffering: no'); // disable nginx/proxy buffering
+echo str_repeat(' ', 4096) . "\n"; // some buffers need a kick of >=4KB
 echo "<!doctype html><html><head><meta charset=utf-8><title>Recovery in progress</title>"
    . "<style>body{font:13px/1.5 monospace;max-width:720px;margin:2em auto;padding:0 1em}"
    . ".ok{color:#1a7f37}.err{color:#c00}</style></head><body>"
    . "<p>repair.php starting…</p>";
-@ob_flush(); flush();
+while(ob_get_level() > 0) ob_end_flush();
+@ob_implicit_flush(true);
+@flush();
 function repair_step($msg) {
-	echo '<p>' . htmlspecialchars($msg, ENT_QUOTES, 'UTF-8') . "</p>\n";
-	@ob_flush(); flush();
+	echo '<p>' . htmlspecialchars($msg, ENT_QUOTES, 'UTF-8') . "</p>\n"
+	   . str_repeat(' ', 256) . "\n";
+	@flush();
 }
 
+repair_step('Validating token format…');
 if(!preg_match('/^[a-f0-9]{40,128}$/', $token)) {
 	repair_fail('Invalid recovery token format. Append the URL exactly as shown in the modal.');
 }
 
+repair_step('Locating recovery state file…');
 if(!is_file($statePath)) {
 	repair_fail('No recovery state available. Either no reset is in progress, or recovery already completed.');
 }
 
+repair_step('Reading state file…');
 $raw = @file_get_contents($statePath);
 if($raw === false) repair_fail('Recovery state unreadable.', 500);
 
@@ -228,8 +236,8 @@ if(!is_array($payload) || empty($payload['token_hash']) || empty($payload['super
 	repair_fail('Recovery state malformed.', 500);
 }
 
+repair_step('Verifying token (bcrypt)…');
 if(!password_verify($token, (string) $payload['token_hash'])) {
-	// Constant-ish delay against rapid brute-force on the bcrypt hash.
 	usleep(500000);
 	repair_fail('Token mismatch.');
 }
@@ -243,14 +251,21 @@ $superuser  = (array) $payload['superuser'];
 $coreSQL    = (string) ($payload['core_sql']    ?? '');
 $profileSQL = (string) ($payload['profile_sql'] ?? '');
 
+repair_step('Checking install.sql files (core: ' . basename($coreSQL) . ', profile: ' . basename($profileSQL) . ')…');
 if(!is_file($coreSQL))    repair_fail('Core install.sql missing: ' . $coreSQL, 500);
 if(!is_file($profileSQL)) repair_fail('Profile install.sql missing: ' . $profileSQL, 500);
 
 // ─── 2. Load config & connect ────────────────────────────────────────────
+repair_step('Loading config.php…');
 if(!is_file($configPhp)) repair_fail('site/config.php not found at ' . $configPhp, 500);
 
 $config = new RepairConfigStub();
-require $configPhp;
+try {
+	require $configPhp;
+} catch(\Throwable $e) {
+	repair_fail('config.php load failed: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine(), 500);
+}
+repair_step('config.php loaded.');
 
 if(empty($config->dbHost) || empty($config->dbName) || empty($config->dbUser)) {
 	repair_fail('Database credentials missing in config.php', 500);
