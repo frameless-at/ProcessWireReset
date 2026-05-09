@@ -224,9 +224,7 @@ the file is actually being served before triggering a real reset.
 ## Tests and dev material
 
 Two artefacts live in the source repository but are **not** shipped in
-the distribution archive (they're marked `export-ignore` in
-`.gitattributes`, so `git archive` and modules.processwire.com tarballs
-omit them):
+the distribution archive:
 
 - `TESTING.md` — manual test scenarios used to validate the module
   after code changes. ~20 scenarios, including the recovery flow.
