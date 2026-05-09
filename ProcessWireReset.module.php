@@ -139,16 +139,23 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// UIkit-flavoured (AdminThemeUikit). Falls back gracefully on other
 		// themes — without UIkit the alert just renders as a plain block,
 		// not pretty but still readable.
-		$banner = '<div id="pwreset-snapshot-banner" class="uk-alert uk-alert-warning"'
-			. ' style="margin:0;border-radius:0;">'
+		// Reuse PW's own notice markup so spacing, font sizes and the
+		// container alignment match the rest of the admin chrome.
+		// pw-notices on the <ul>, NoticeMessage + uk-alert-warning on the
+		// <li>, and the standard pw-container/uk-container-expand wrapper
+		// inside. Only the flex layout for the right-aligned link is
+		// inline; everything else inherits from PW's stylesheet.
+		$banner = '<ul class="pw-notices" id="pwreset-snapshot-banner">'
+			. '<li class="NoticeMessage uk-alert uk-alert-warning">'
 			. '<div class="pw-container uk-container uk-container-expand"'
 			. ' style="display:flex;align-items:center;gap:1em;flex-wrap:wrap;">'
-			. '<span uk-icon="icon: database"></span>'
+			. '<i class="fa fa-database pw-nav-icon fa-fw"></i>'
 			. '<strong>' . $title . '</strong>'
 			. '<span style="flex:1">' . $body . '</span>'
 			. '<a href="' . $editUrl . '">' . $linkLabel . '</a>'
 			. '</div>'
-			. '</div>';
+			. '</li>'
+			. '</ul>';
 
 		$event->return = preg_replace('/(<body\b[^>]*>)/i', '$1' . $banner, $out, 1);
 	}
