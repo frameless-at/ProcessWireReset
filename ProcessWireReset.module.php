@@ -140,7 +140,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// themes — without UIkit the alert just renders as a plain block,
 		// not pretty but still readable.
 		$banner = '<div id="pwreset-snapshot-banner" class="uk-alert uk-alert-warning"'
-			. ' style="margin:0;padding:0;border-radius:0;">'
+			. ' style="margin:0;border-radius:0;">'
 			. '<div class="pw-container uk-container uk-container-expand"'
 			. ' style="display:flex;align-items:center;gap:1em;flex-wrap:wrap;">'
 			. '<span uk-icon="icon: database"></span>'
