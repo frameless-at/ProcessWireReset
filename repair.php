@@ -89,33 +89,58 @@ $configPhp = $siteDir . '/config.php';
 $moduleDir = $siteDir . '/modules/ProcessWireReset';
 
 // ─── Render helpers ──────────────────────────────────────────────────────
-function repair_response($status, $title, $body, $loginUrl = '') {
+// Two render paths:
+//   * Pre-stream (no heartbeat yet, e.g. diagnostic page or token-format
+//     reject): full standalone HTML page.
+//   * Post-stream (heartbeat already opened steps list): close the list
+//     and append a status banner so the same page reads as one document.
+function repair_response($status, $title, $body, $loginUrl = '', $variant = 'ok') {
 	$h     = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
-	$login = $loginUrl ? '<p><a href="' . $h($loginUrl) . '">Continue to login →</a></p>' : '';
+	$login = $loginUrl ? '<p><a href="' . $h($loginUrl) . '">Continue to login &rarr;</a></p>' : '';
+	$cls   = $variant === 'ok' ? 'banner ok' : 'banner err';
 	if(!headers_sent()) {
 		http_response_code($status);
 		header('Content-Type: text/html; charset=utf-8');
 		header('Cache-Control: no-store, no-cache, must-revalidate');
 		header('Pragma: no-cache');
 		header('X-Robots-Tag: noindex, nofollow');
-		echo '<!doctype html><html><head><meta charset="utf-8"><title>' . $h($title)
-			. '</title><meta name="viewport" content="width=device-width,initial-scale=1">'
-			. '<style>body{font:14px/1.5 system-ui,sans-serif;max-width:640px;margin:3em auto;padding:0 1em;color:#333}'
-			. 'h1{font-size:1.4em} pre{background:#f4f4f4;padding:1em;overflow:auto;font-size:12px}'
-			. 'table{border-collapse:collapse;width:100%} td,th{padding:.4em .6em;border-bottom:1px solid #eee;text-align:left}'
-			. '.ok{color:#1a7f37} .err{color:#c00} .warn{color:#a07000}</style></head><body>'
-			. '<h1>' . $h($title) . '</h1>' . $body . $login . '</body></html>';
+		echo '<!doctype html><html lang=en><head><meta charset="utf-8">'
+			. '<title>' . $h($title) . '</title>'
+			. '<meta name="viewport" content="width=device-width,initial-scale=1">'
+			. '<style>'
+			. '*{box-sizing:border-box}'
+			. 'body{font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;'
+			. 'max-width:560px;margin:3em auto;padding:0 1.5em;color:#1f2937;background:#f7f8fa}'
+			. 'h1{font-size:1.45rem;font-weight:600;margin:0 0 .25em;color:#111827}'
+			. '.lede{color:#6b7280;margin:0 0 1.5em;font-size:.95rem}'
+			. 'table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e5e7eb;'
+			. 'border-radius:8px;overflow:hidden}'
+			. 'th,td{padding:.6em .9em;border-bottom:1px solid #f3f4f6;text-align:left;font-size:.92rem}'
+			. 'tr:last-child th,tr:last-child td{border-bottom:0}'
+			. 'th{font-weight:500;color:#374151;width:60%}'
+			. '.banner{margin-top:0;padding:1.1em 1.4em;border-radius:8px}'
+			. '.banner h1{margin:0 0 .35em;font-size:1.15rem}'
+			. '.banner.ok{background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46}'
+			. '.banner.ok a{color:#065f46;font-weight:600}'
+			. '.banner.err{background:#fef2f2;border:1px solid #fca5a5;color:#991b1b}'
+			. '.ok{color:#065f46}.err{color:#991b1b}'
+			. 'code{font:12.5px ui-monospace,Menlo,Consolas,monospace;background:#f3f4f6;'
+			. 'padding:1px 5px;border-radius:3px}'
+			. '</style></head><body>'
+			. '<div class="' . $cls . '"><h1>' . $h($title) . '</h1>' . $body . $login . '</div>'
+			. '</body></html>';
 	} else {
-		// Streaming mode: heartbeat already opened the page. Append a
-		// closing block instead of starting a new <html> wrapper.
-		echo '<hr><h2>' . $h($title) . '</h2>' . $body . $login . '</body></html>';
+		// Streaming mode — close the steps list and append the banner.
+		echo '</ul>'
+			. '<div class="' . $cls . '"><h2>' . $h($title) . '</h2>'
+			. $body . $login . '</div></body></html>';
 	}
 	exit;
 }
 
 function repair_fail($msg, $code = 403) {
 	$h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
-	repair_response($code, 'Recovery unavailable', '<p class="err">' . $h($msg) . '</p>');
+	repair_response($code, 'Recovery unavailable', '<p>' . $h($msg) . '</p>', '', 'err');
 }
 
 function repair_diagnose($statePath, $configPhp, $wireDir) {
@@ -168,6 +193,59 @@ function repair_diagnose($statePath, $configPhp, $wireDir) {
 	);
 }
 
+// ─── PW config.php parser ────────────────────────────────────────────────
+// Walks the PHP token stream of config.php and lifts top-level scalar
+// assignments to $config->KEY. More robust than regex: tolerates
+// conditionals, heredoc/nowdoc strings, comments, multiple reassignments
+// (last wins). Constants on the right-hand side are not resolved.
+function repair_parse_pw_config($source) {
+	$tokens = @token_get_all($source);
+	if(!is_array($tokens)) return [];
+	$out = [];
+	$n   = count($tokens);
+	for($i = 0; $i < $n; $i++) {
+		$t = $tokens[$i];
+		if(!is_array($t) || $t[0] !== T_VARIABLE || $t[1] !== '$config') continue;
+		$j = $i + 1;
+		while($j < $n && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) $j++;
+		if($j >= $n || !is_array($tokens[$j]) || $tokens[$j][0] !== T_OBJECT_OPERATOR) continue;
+		$j++;
+		while($j < $n && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) $j++;
+		if($j >= $n || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING) continue;
+		$key = $tokens[$j][1];
+		$j++;
+		while($j < $n && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) $j++;
+		if($j >= $n || $tokens[$j] !== '=') continue;
+		$j++;
+		while($j < $n && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) $j++;
+		if($j >= $n) continue;
+		$v = $tokens[$j];
+		if(!is_array($v)) continue;
+		switch($v[0]) {
+			case T_CONSTANT_ENCAPSED_STRING:
+				// Strip surrounding quote and unescape
+				$lit = $v[1];
+				$quote = $lit[0] ?? '';
+				if($quote === '"' || $quote === "'") {
+					$inner = substr($lit, 1, -1);
+					$out[$key] = $quote === "'"
+						? str_replace(["\\'", "\\\\"], ["'", "\\"], $inner)
+						: stripcslashes($inner);
+				}
+				break;
+			case T_LNUMBER: $out[$key] = (int)   $v[1]; break;
+			case T_DNUMBER: $out[$key] = (float) $v[1]; break;
+			case T_STRING:
+				$lc = strtolower($v[1]);
+				if($lc === 'true')  $out[$key] = true;
+				elseif($lc === 'false') $out[$key] = false;
+				elseif($lc === 'null')  $out[$key] = null;
+				break;
+		}
+	}
+	return $out;
+}
+
 // ─── 1. Token & state file ───────────────────────────────────────────────
 $token     = isset($_GET['token']) ? (string) $_GET['token'] : '';
 $statePath = $moduleDir . '/' . RECOVERY_STATE_FILE;
@@ -185,32 +263,55 @@ if($token === '') {
 // progress text + the shutdown trap above is what the user sees.
 header('Content-Type: text/html; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate');
-header('X-Accel-Buffering: no'); // disable nginx/proxy buffering
-echo str_repeat(' ', 4096) . "\n"; // some buffers need a kick of >=4KB
-echo "<!doctype html><html><head><meta charset=utf-8><title>Recovery in progress</title>"
-   . "<style>body{font:13px/1.5 monospace;max-width:720px;margin:2em auto;padding:0 1em}"
-   . ".ok{color:#1a7f37}.err{color:#c00}</style></head><body>"
-   . "<p>repair.php starting…</p>";
+header('X-Accel-Buffering: no');                   // disable nginx/proxy buffering
+echo str_repeat(' ', 4096) . "\n";                 // some buffers need a kick of >=4KB
+echo "<!doctype html><html lang=en><head><meta charset=utf-8>"
+   . "<title>ProcessWire Recovery</title>"
+   . "<meta name=viewport content='width=device-width,initial-scale=1'>"
+   . "<style>"
+   . "*{box-sizing:border-box}"
+   . "body{font:14px/1.55 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
+   . "max-width:560px;margin:3em auto;padding:0 1.5em;color:#1f2937;background:#f7f8fa}"
+   . "h1{font-size:1.45rem;font-weight:600;margin:0 0 .25em;color:#111827}"
+   . ".lede{color:#6b7280;margin:0 0 1.75em;font-size:.95rem}"
+   . ".steps{background:#fff;border:1px solid #e5e7eb;border-radius:8px;"
+   . "padding:.25em 1.1em;margin:0;list-style:none;box-shadow:0 1px 2px rgba(0,0,0,.03)}"
+   . ".step{display:flex;align-items:center;gap:.7em;padding:.65em 0;"
+   . "border-bottom:1px solid #f3f4f6;font-size:.95rem}"
+   . ".step:last-child{border-bottom:0}"
+   . ".step .ic{flex:0 0 18px;width:18px;height:18px;border-radius:50%;"
+   . "display:inline-flex;align-items:center;justify-content:center;"
+   . "font-size:11px;font-weight:700;color:#fff;background:#10b981}"
+   . ".banner{margin-top:1.5em;padding:1.1em 1.4em;border-radius:8px;"
+   . "box-shadow:0 1px 2px rgba(0,0,0,.04)}"
+   . ".banner h2{margin:0 0 .35em;font-size:1.1rem;font-weight:600}"
+   . ".banner p{margin:.25em 0}"
+   . ".banner.ok{background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46}"
+   . ".banner.ok a{color:#065f46;font-weight:600}"
+   . ".banner.err{background:#fef2f2;border:1px solid #fca5a5;color:#991b1b}"
+   . "code{font:12.5px ui-monospace,Menlo,Consolas,monospace;background:#f3f4f6;"
+   . "padding:1px 5px;border-radius:3px}"
+   . "</style></head><body>"
+   . "<h1>ProcessWire Recovery</h1>"
+   . "<p class=lede>Restoring the installation to a clean default state with the original superuser credentials.</p>"
+   . "<ul class=steps>";
 while(ob_get_level() > 0) ob_end_flush();
 @ob_implicit_flush(true);
 @flush();
 function repair_step($msg) {
-	echo '<p>' . htmlspecialchars($msg, ENT_QUOTES, 'UTF-8') . "</p>\n"
+	echo '<li class="step"><span class="ic">&#10003;</span><span>'
+	   . htmlspecialchars($msg, ENT_QUOTES, 'UTF-8') . "</span></li>\n"
 	   . str_repeat(' ', 256) . "\n";
 	@flush();
 }
 
-repair_step('Validating token format…');
 if(!preg_match('/^[a-f0-9]{40,128}$/', $token)) {
 	repair_fail('Invalid recovery token format. Append the URL exactly as shown in the modal.');
 }
-
-repair_step('Locating recovery state file…');
 if(!is_file($statePath)) {
 	repair_fail('No recovery state available. Either no reset is in progress, or recovery already completed.');
 }
 
-repair_step('Reading state file…');
 $raw = @file_get_contents($statePath);
 if($raw === false) repair_fail('Recovery state unreadable.', 500);
 
@@ -222,11 +323,11 @@ if(!is_array($payload) || empty($payload['token_hash']) || empty($payload['super
 	repair_fail('Recovery state malformed.', 500);
 }
 
-repair_step('Verifying token (bcrypt)…');
 if(!password_verify($token, (string) $payload['token_hash'])) {
 	usleep(500000);
 	repair_fail('Token mismatch.');
 }
+repair_step('Token verified');
 
 if(isset($payload['expires_at']) && time() > (int) $payload['expires_at']) {
 	@unlink($statePath);
@@ -237,52 +338,44 @@ $superuser  = (array) $payload['superuser'];
 $coreSQL    = (string) ($payload['core_sql']    ?? '');
 $profileSQL = (string) ($payload['profile_sql'] ?? '');
 
-repair_step('Checking install.sql files (core: ' . basename($coreSQL) . ', profile: ' . basename($profileSQL) . ')…');
-if(!is_file($coreSQL))    repair_fail('Core install.sql missing: ' . $coreSQL, 500);
-if(!is_file($profileSQL)) repair_fail('Profile install.sql missing: ' . $profileSQL, 500);
+if(!is_file($coreSQL))    repair_fail('Core install.sql missing.', 500);
+if(!is_file($profileSQL)) repair_fail('Profile install.sql missing.', 500);
+repair_step('Install profiles located');
 
 // ─── 2. Load config & connect ────────────────────────────────────────────
-repair_step('Loading config.php…');
-if(!is_file($configPhp)) repair_fail('site/config.php not found at ' . $configPhp, 500);
+if(!is_file($configPhp)) repair_fail('config.php not found at the expected path.', 500);
 
 // We do NOT require() config.php — some installations have config.php
 // pull in further files, call into PW classes, or otherwise crash a
 // stand-alone include in ways that bypass try/catch and the shutdown
-// handler (FastCGI stream abort). Lift the DB credentials with a
-// regex instead. Works for the (overwhelmingly common) case where
-// they are plain string / int literals.
+// handler (FastCGI stream abort). The PHP tokenizer walks the file
+// instead and lifts top-level scalar assignments to $config->*.
 $configRaw = (string) @file_get_contents($configPhp);
 if($configRaw === '') repair_fail('config.php is empty or unreadable', 500);
 
-$cfgVal = function($key, $default = null) use ($configRaw) {
-	$q = preg_quote($key, '/');
-	if(preg_match('/\$config->' . $q . '\s*=\s*([\'"])((?:\\\\.|(?!\1).)*)\1\s*;/s', $configRaw, $m)) {
-		return stripcslashes($m[2]);
-	}
-	if(preg_match('/\$config->' . $q . '\s*=\s*(\d+)\s*;/', $configRaw, $m)) {
-		return (int) $m[1];
-	}
-	return $default;
-};
+$cfgValues = repair_parse_pw_config($configRaw);
 
-$dbHost    = (string) $cfgVal('dbHost');
-$dbName    = (string) $cfgVal('dbName');
-$dbUser    = (string) $cfgVal('dbUser');
-$dbPass    = (string) $cfgVal('dbPass', '');
-$dbPort    = (int)    $cfgVal('dbPort', 3306);
-$dbCharset = (string) $cfgVal('dbCharset', 'utf8');
-$dbEngine  = (string) $cfgVal('dbEngine', 'InnoDB');
-
-repair_step('Parsed credentials from config.php: ' . $dbUser . '@' . $dbHost . '/' . $dbName . ' (port ' . $dbPort . ', charset ' . $dbCharset . ', engine ' . $dbEngine . ')');
+$dbHost    = (string) ($cfgValues['dbHost']    ?? '');
+$dbName    = (string) ($cfgValues['dbName']    ?? '');
+$dbUser    = (string) ($cfgValues['dbUser']    ?? '');
+$dbPass    = (string) ($cfgValues['dbPass']    ?? '');
+$dbPort    = (int)    ($cfgValues['dbPort']    ?? 3306);
+$dbCharset = (string) ($cfgValues['dbCharset'] ?? 'utf8');
+$dbEngine  = (string) ($cfgValues['dbEngine']  ?? 'InnoDB');
 
 if($dbHost === '' || $dbName === '' || $dbUser === '') {
-	repair_fail('Could not parse DB credentials out of config.php — they may be set conditionally or via constants. Open the file and confirm $config->dbHost / dbName / dbUser are simple literal assignments.', 500);
+	repair_fail(
+		'Could not extract DB credentials from config.php — they may be set '
+		. 'conditionally or via constants. Verify that $config->dbHost / dbName / '
+		. 'dbUser are simple literal assignments.',
+		500
+	);
 }
+repair_step('Database credentials read from config.php');
 
 $dsn = 'mysql:host=' . $dbHost . ';dbname=' . $dbName
 	. ';port=' . $dbPort
 	. ';charset=' . $dbCharset;
-repair_step('Connecting to database…');
 try {
 	$pdo = new \PDO($dsn, $dbUser, $dbPass, [
 		\PDO::ATTR_ERRMODE            => \PDO::ERRMODE_EXCEPTION,
@@ -292,7 +385,7 @@ try {
 } catch(\PDOException $e) {
 	repair_fail('DB connect failed: ' . $e->getMessage(), 500);
 }
-repair_step('DB connection ok.');
+repair_step('Database connected');
 
 // ─── 3. Drop all tables (multi-pass for FKs) ─────────────────────────────
 function repair_drop_all(\PDO $pdo, $dbName) {
@@ -330,14 +423,13 @@ function repair_drop_all(\PDO $pdo, $dbName) {
 	return (int) $stmt->fetchColumn();
 }
 
-repair_step('Dropping all tables…');
 try {
 	$remaining = repair_drop_all($pdo, $dbName);
 	if($remaining > 0) repair_fail("Could not drop all tables ($remaining remain). Aborting.", 500);
 } catch(\PDOException $e) {
 	repair_fail('DROP TABLES failed: ' . $e->getMessage(), 500);
 }
-repair_step('All tables dropped.');
+repair_step('All tables dropped');
 
 // ─── 4. Import core + profile install.sql via WireDatabaseBackup ─────────
 $wdbFile = $wireDir . '/core/WireDatabaseBackup.php';
@@ -363,7 +455,6 @@ if(strtolower($dbCharset) === 'utf8mb4') {
 	}
 }
 
-repair_step('Importing core install.sql + profile install.sql…');
 try {
 	$backup = new WireDatabaseBackup();
 	$backup->setDatabase($pdo);
@@ -372,10 +463,9 @@ try {
 		repair_fail('SQL import failed: ' . $errs, 500);
 	}
 } catch(\Throwable $e) {
-	repair_fail('SQL import threw: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine(), 500);
+	repair_fail('SQL import threw: ' . $e->getMessage(), 500);
 }
-repair_step('SQL import complete.');
-repair_step('Restoring superuser (' . ($superuser['name'] ?? '?') . ')…');
+repair_step('Fresh schema imported');
 
 // ─── 5. Restore superuser ────────────────────────────────────────────────
 try {
@@ -434,11 +524,13 @@ try {
 } catch(\PDOException $e) {
 	repair_fail('Superuser restore failed: ' . $e->getMessage(), 500);
 }
+repair_step('Superuser restored');
 
 // ─── 6. Cleanup state + pending files ────────────────────────────────────
 @unlink($statePath);
 @unlink($moduleDir . '/' . PENDING_FILE);
 @unlink($moduleDir . '/' . PENDING_TABLES_FILE);
+repair_step('Recovery state cleared');
 
 // ─── 7. Success ──────────────────────────────────────────────────────────
 $adminUrl = '/processwire/'; // best-effort default; admin page name was restored above
@@ -449,8 +541,9 @@ if(!empty($superuser['admin_name'])) {
 repair_response(
 	200,
 	'Recovery complete',
-	'<p class="ok">A clean default install was performed using your original superuser credentials.</p>'
-	. '<p>Custom modules, templates and fields were <strong>not</strong> restored. '
-	. 'If a specific module caused the original crash, you can re-install it manually after logging in.</p>',
+	'<p>The installation is back to a clean default state and your original '
+	. 'superuser credentials are valid again. Custom modules, templates and '
+	. 'fields were not restored — re-install them from your sources after '
+	. 'logging in.</p>',
 	$adminUrl
 );
