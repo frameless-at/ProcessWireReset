@@ -18,6 +18,33 @@
  *   - `wire/core/install.sql` and the bundled profile install.sql exist
  */
 
+// Recovery is a destructive last-resort tool — surface every error.
+// Otherwise a silent fatal during DROP TABLES / SQL import / restore
+// leaves the user staring at a blank page with no clue what went wrong.
+error_reporting(E_ALL);
+ini_set('display_errors',         '1');
+ini_set('display_startup_errors', '1');
+@set_time_limit(300);
+@ini_set('memory_limit', '512M');
+
+// Shutdown trap so a fatal that escapes the try/catch blocks below
+// still produces a visible error message instead of an empty 200.
+register_shutdown_function(function() {
+	$err = error_get_last();
+	if(!$err) return;
+	$fatalTypes = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR];
+	if(!in_array($err['type'], $fatalTypes, true)) return;
+	if(!headers_sent()) {
+		http_response_code(500);
+		header('Content-Type: text/plain; charset=utf-8');
+	}
+	echo "\n\n--- repair.php fatal ---\n"
+		. "type:    " . $err['type'] . "\n"
+		. "message: " . $err['message'] . "\n"
+		. "file:    " . $err['file'] . "\n"
+		. "line:    " . $err['line'] . "\n";
+});
+
 // ─── Stub config object ──────────────────────────────────────────────────
 // PW's config.php sets `$config->dbHost = ...` etc. on whatever object is
 // in scope. Magic accessors absorb any property the config touches without
@@ -79,20 +106,26 @@ $moduleDir = $siteDir . '/modules/ProcessWireReset';
 
 // ─── Render helpers ──────────────────────────────────────────────────────
 function repair_response($status, $title, $body, $loginUrl = '') {
-	http_response_code($status);
-	header('Content-Type: text/html; charset=utf-8');
-	header('Cache-Control: no-store, no-cache, must-revalidate');
-	header('Pragma: no-cache');
-	header('X-Robots-Tag: noindex, nofollow');
 	$h     = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
 	$login = $loginUrl ? '<p><a href="' . $h($loginUrl) . '">Continue to login →</a></p>' : '';
-	echo '<!doctype html><html><head><meta charset="utf-8"><title>' . $h($title)
-		. '</title><meta name="viewport" content="width=device-width,initial-scale=1">'
-		. '<style>body{font:14px/1.5 system-ui,sans-serif;max-width:640px;margin:3em auto;padding:0 1em;color:#333}'
-		. 'h1{font-size:1.4em} pre{background:#f4f4f4;padding:1em;overflow:auto;font-size:12px}'
-		. 'table{border-collapse:collapse;width:100%} td,th{padding:.4em .6em;border-bottom:1px solid #eee;text-align:left}'
-		. '.ok{color:#1a7f37} .err{color:#c00} .warn{color:#a07000}</style></head><body>'
-		. '<h1>' . $h($title) . '</h1>' . $body . $login . '</body></html>';
+	if(!headers_sent()) {
+		http_response_code($status);
+		header('Content-Type: text/html; charset=utf-8');
+		header('Cache-Control: no-store, no-cache, must-revalidate');
+		header('Pragma: no-cache');
+		header('X-Robots-Tag: noindex, nofollow');
+		echo '<!doctype html><html><head><meta charset="utf-8"><title>' . $h($title)
+			. '</title><meta name="viewport" content="width=device-width,initial-scale=1">'
+			. '<style>body{font:14px/1.5 system-ui,sans-serif;max-width:640px;margin:3em auto;padding:0 1em;color:#333}'
+			. 'h1{font-size:1.4em} pre{background:#f4f4f4;padding:1em;overflow:auto;font-size:12px}'
+			. 'table{border-collapse:collapse;width:100%} td,th{padding:.4em .6em;border-bottom:1px solid #eee;text-align:left}'
+			. '.ok{color:#1a7f37} .err{color:#c00} .warn{color:#a07000}</style></head><body>'
+			. '<h1>' . $h($title) . '</h1>' . $body . $login . '</body></html>';
+	} else {
+		// Streaming mode: heartbeat already opened the page. Append a
+		// closing block instead of starting a new <html> wrapper.
+		echo '<hr><h2>' . $h($title) . '</h2>' . $body . $login . '</body></html>';
+	}
 	exit;
 }
 
@@ -159,6 +192,23 @@ if($token === '') {
 	repair_diagnose($statePath, $configPhp, $wireDir);
 }
 
+// Stream a minimal heartbeat so a stalling step (DROP TABLES, SQL
+// import) is visible instead of looking like "nothing happens".
+// repair_response() at the end discards the buffer and writes the
+// real success page. If a fatal kills us mid-stream the captured
+// progress text + the shutdown trap above is what the user sees.
+header('Content-Type: text/html; charset=utf-8');
+header('Cache-Control: no-store, no-cache, must-revalidate');
+echo "<!doctype html><html><head><meta charset=utf-8><title>Recovery in progress</title>"
+   . "<style>body{font:13px/1.5 monospace;max-width:720px;margin:2em auto;padding:0 1em}"
+   . ".ok{color:#1a7f37}.err{color:#c00}</style></head><body>"
+   . "<p>repair.php starting…</p>";
+@ob_flush(); flush();
+function repair_step($msg) {
+	echo '<p>' . htmlspecialchars($msg, ENT_QUOTES, 'UTF-8') . "</p>\n";
+	@ob_flush(); flush();
+}
+
 if(!preg_match('/^[a-f0-9]{40,128}$/', $token)) {
 	repair_fail('Invalid recovery token format. Append the URL exactly as shown in the modal.');
 }
@@ -209,6 +259,8 @@ if(empty($config->dbHost) || empty($config->dbName) || empty($config->dbUser)) {
 $dsn = 'mysql:host=' . $config->dbHost . ';dbname=' . $config->dbName
 	. ';port=' . (int) ($config->dbPort ?: 3306)
 	. ';charset=' . ($config->dbCharset ?: 'utf8');
+repair_step('Token verified, state file decoded.');
+repair_step('Connecting to database (' . $config->dbName . '@' . $config->dbHost . ')…');
 try {
 	$pdo = new \PDO($dsn, (string) $config->dbUser, (string) $config->dbPass, [
 		\PDO::ATTR_ERRMODE            => \PDO::ERRMODE_EXCEPTION,
@@ -218,6 +270,7 @@ try {
 } catch(\PDOException $e) {
 	repair_fail('DB connect failed: ' . $e->getMessage(), 500);
 }
+repair_step('DB connection ok.');
 
 // ─── 3. Drop all tables (multi-pass for FKs) ─────────────────────────────
 function repair_drop_all(\PDO $pdo, $dbName) {
@@ -255,12 +308,14 @@ function repair_drop_all(\PDO $pdo, $dbName) {
 	return (int) $stmt->fetchColumn();
 }
 
+repair_step('Dropping all tables…');
 try {
 	$remaining = repair_drop_all($pdo, $config->dbName);
 	if($remaining > 0) repair_fail("Could not drop all tables ($remaining remain). Aborting.", 500);
 } catch(\PDOException $e) {
 	repair_fail('DROP TABLES failed: ' . $e->getMessage(), 500);
 }
+repair_step('All tables dropped.');
 
 // ─── 4. Import core + profile install.sql via WireDatabaseBackup ─────────
 $wdbFile = $wireDir . '/core/WireDatabaseBackup.php';
@@ -286,6 +341,7 @@ if(strtolower((string) $config->dbCharset) === 'utf8mb4') {
 	}
 }
 
+repair_step('Importing core install.sql + profile install.sql…');
 try {
 	$backup = new WireDatabaseBackup();
 	$backup->setDatabase($pdo);
@@ -294,8 +350,10 @@ try {
 		repair_fail('SQL import failed: ' . $errs, 500);
 	}
 } catch(\Throwable $e) {
-	repair_fail('SQL import threw: ' . $e->getMessage(), 500);
+	repair_fail('SQL import threw: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine(), 500);
 }
+repair_step('SQL import complete.');
+repair_step('Restoring superuser (' . ($superuser['name'] ?? '?') . ')…');
 
 // ─── 5. Restore superuser ────────────────────────────────────────────────
 try {
