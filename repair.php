@@ -56,6 +56,8 @@ $wireDir   = $pwRoot ? $pwRoot . '/wire' : '';
 function repair_response($status, $title, $body, $loginUrl = '') {
 	http_response_code($status);
 	header('Content-Type: text/html; charset=utf-8');
+	header('Cache-Control: no-store, no-cache, must-revalidate');
+	header('Pragma: no-cache');
 	header('X-Robots-Tag: noindex, nofollow');
 	$h     = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
 	$login = $loginUrl ? '<p><a href="' . $h($loginUrl) . '">Continue to login →</a></p>' : '';
@@ -63,7 +65,8 @@ function repair_response($status, $title, $body, $loginUrl = '') {
 		. '</title><meta name="viewport" content="width=device-width,initial-scale=1">'
 		. '<style>body{font:14px/1.5 system-ui,sans-serif;max-width:640px;margin:3em auto;padding:0 1em;color:#333}'
 		. 'h1{font-size:1.4em} pre{background:#f4f4f4;padding:1em;overflow:auto;font-size:12px}'
-		. '.ok{color:#1a7f37} .err{color:#c00}</style></head><body>'
+		. 'table{border-collapse:collapse;width:100%} td,th{padding:.4em .6em;border-bottom:1px solid #eee;text-align:left}'
+		. '.ok{color:#1a7f37} .err{color:#c00} .warn{color:#a07000}</style></head><body>'
 		. '<h1>' . $h($title) . '</h1>' . $body . $login . '</body></html>';
 	exit;
 }
@@ -73,13 +76,68 @@ function repair_fail($msg, $code = 403) {
 	repair_response($code, 'Recovery unavailable', '<p class="err">' . $h($msg) . '</p>');
 }
 
-// ─── 1. Token & state file ───────────────────────────────────────────────
-$token = isset($_GET['token']) ? (string) $_GET['token'] : '';
-if(!preg_match('/^[a-f0-9]{40,128}$/', $token)) {
-	repair_fail('Invalid or missing recovery token.');
+function repair_diagnose($statePath, $configPhp, $wireDir) {
+	$h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
+	$row = function($k, $v, $cls = '') use ($h) {
+		return '<tr><th>' . $h($k) . '</th><td' . ($cls ? ' class="' . $cls . '"' : '') . '>' . $v . '</td></tr>';
+	};
+	$yn  = function($b) { return $b ? '<span class="ok">yes</span>' : '<span class="err">no</span>'; };
+
+	$rows = '';
+	$rows .= $row('Script reachable', '<span class="ok">yes (you would not see this otherwise)</span>');
+	$rows .= $row('repair.php path', $h(__FILE__));
+	$rows .= $row('PHP version', $h(PHP_VERSION));
+
+	$stateExists = is_file($statePath);
+	$rows .= $row('recovery.state.php exists', $yn($stateExists));
+	$rows .= $row('recovery.state.php path', $h($statePath));
+
+	if($stateExists) {
+		$readable = is_readable($statePath);
+		$rows .= $row('recovery.state.php readable', $yn($readable));
+		if($readable) {
+			$raw   = (string) @file_get_contents($statePath);
+			$parts = explode('==RECOVERY-STATE==', $raw);
+			$wellFormed = count($parts) >= 3;
+			$rows .= $row('state file format markers found', $yn($wellFormed));
+			if($wellFormed) {
+				$payload = @json_decode((string) base64_decode(trim($parts[1]), true), true);
+				$valid   = is_array($payload) && !empty($payload['token_hash']) && !empty($payload['superuser']);
+				$rows .= $row('state payload decodes', $yn($valid));
+				if($valid) {
+					$exp     = (int) ($payload['expires_at'] ?? 0);
+					$expired = $exp > 0 && time() > $exp;
+					$rows .= $row('expires_at', $h(date('c', $exp)) . ($expired ? ' <span class="err">(EXPIRED)</span>' : ' <span class="ok">(valid)</span>'));
+					$rows .= $row('superuser name', $h((string) ($payload['superuser']['name'] ?? '?')));
+					$rows .= $row('core_sql exists', $yn(is_file((string) ($payload['core_sql'] ?? ''))));
+					$rows .= $row('profile_sql exists', $yn(is_file((string) ($payload['profile_sql'] ?? ''))));
+				}
+			}
+		}
+	}
+
+	$rows .= $row('config.php exists', $yn(is_file($configPhp)));
+	$rows .= $row('wire/core/WireDatabaseBackup.php exists', $yn(is_file($wireDir . '/core/WireDatabaseBackup.php')));
+
+	$body = '<p>Diagnostic mode (no <code>?token=</code> in URL). Append <code>?token=YOUR_TOKEN</code> to actually run the recovery.</p>'
+		. '<table>' . $rows . '</table>';
+	repair_response(200, 'Recovery diagnostic', $body);
 }
 
+// ─── 1. Token & state file ───────────────────────────────────────────────
+$token     = isset($_GET['token']) ? (string) $_GET['token'] : '';
 $statePath = $moduleDir . '/' . RECOVERY_STATE_FILE;
+
+// No token → diagnostic page (status 200) so the user can see exactly
+// why a previous attempt failed without having to inspect the server.
+if($token === '') {
+	repair_diagnose($statePath, $configPhp, $wireDir);
+}
+
+if(!preg_match('/^[a-f0-9]{40,128}$/', $token)) {
+	repair_fail('Invalid recovery token format. Append the URL exactly as shown in the modal.');
+}
+
 if(!is_file($statePath)) {
 	repair_fail('No recovery state available. Either no reset is in progress, or recovery already completed.');
 }
