@@ -1,3 +1,17 @@
+# ProcessWire's top-level .htaccess blocks direct HTTP access to .php
+# files inside site/modules/ via a RewriteRule … [F,L]. That rule fires
+# before any access control we declare here, so without an override
+# repair.php would be unreachable (403 from Apache, before PHP runs).
+#
+# The [END] flag (Apache 2.4+) stops the rewrite engine completely —
+# also across parent .htaccess files — so the request reaches
+# repair.php normally. The flag is only set for repair.php; every
+# other path keeps PW's standard restrictions.
+<IfModule mod_rewrite.c>
+	RewriteEngine On
+	RewriteRule ^repair\.php$ - [END]
+</IfModule>
+
 # Defense in depth: deny direct HTTP access to internal state files.
 # repair.php (the recovery endpoint) and the install/ profile directory
 # are NOT blocked here — they are intended to be reachable.
