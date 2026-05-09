@@ -148,24 +148,28 @@ familiar admin login. Custom templates, fields and modules need to be
 restored separately (from version control, a profile, or a database
 dump if you took one).
 
-### Hosting-provider 403 on repair.php
+### Recovery endpoint location
 
-Some shared-hosting setups (deny `.php` execution under `site/modules/`
-via a server-level rule, restrictive `AllowOverride`, or mod_security)
-return 403 for the recovery URL even though the bundled `.htaccess`
-tries to whitelist `repair.php`. The fix is one extra step:
+When the module is installed, `install()` copies `repair.php` from
+the module directory into the PW document root and renames it to
+`pwreset_repair.php`. The recovery URL in the confirmation modal
+points at that copy: `https://your-site.tld/pwreset_repair.php?token=…`.
 
-1. After installing the module, copy `repair.php` from
-   `site/modules/ProcessWireReset/` into your PW document root
-   (the directory that contains `index.php`).
-2. Use the alternative URL when triggering recovery:
-   `https://your-site.tld/repair.php?token=…` (instead of
-   `…/site/modules/ProcessWireReset/repair.php?token=…`).
+This is deliberate: many shared-hosting setups block `.php` execution
+under `site/modules/` (mod_security, restrictive `AllowOverride`,
+hosting-platform rules), and the bundled `.htaccess` cannot always
+override that. The PW document root is where `index.php` lives, so
+`.php` execution is reliably permitted there.
 
-`repair.php` walks up the directory tree until it finds
+If `install()` cannot write to the document root (read-only mount,
+permission mismatch), it throws with a clear message. In that case,
+copy `repair.php` from `site/modules/ProcessWireReset/` to
+`<docroot>/pwreset_repair.php` manually before triggering a reset.
+`uninstall()` removes the file again.
+
+The recovery endpoint walks up the directory tree until it finds
 `site/config.php` and `wire/core/install.sql`, so it works from
-either location. The state file always stays inside the module
-directory.
+either location.
 
 ## Security notes
 

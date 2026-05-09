@@ -41,6 +41,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/** Recovery token byte length (32 bytes → 64 hex chars) */
 	const RECOVERY_TOKEN_BYTES = 32;
 
+	/** Filename of the recovery endpoint copied to the document root on install */
+	const RECOVERY_SCRIPT = 'pwreset_repair.php';
+
 	/** @var string[] Filesystem operation failures collected during Phase 3 */
 	protected $fsFailures = [];
 
@@ -86,6 +89,43 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		if(!file_exists(__DIR__ . '/' . self::PENDING_FILE)
 		&& !file_exists(__DIR__ . '/' . self::PENDING_TABLES_FILE)) return;
 		$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
+	}
+
+	/**
+	 * Copy the recovery endpoint into the PW document root on install.
+	 *
+	 * The bundled .htaccess in site/modules/ tries to whitelist
+	 * repair.php, but many shared-hosting setups block .php execution
+	 * under site/modules/ at the server level (mod_security, restrictive
+	 * AllowOverride, etc.) and Apache returns 403 before our override
+	 * gets to run. Putting the recovery script into the same directory
+	 * as index.php sidesteps that block — that is where index.php and
+	 * (during initial install) install.php live, so .php execution is
+	 * always permitted.
+	 */
+	public function ___install() {
+		$src = __DIR__ . '/repair.php';
+		$dst = $this->wire('config')->paths->root . self::RECOVERY_SCRIPT;
+		if(!is_file($src)) {
+			throw new WireException('ProcessWireReset: repair.php missing from module directory.');
+		}
+		if(@copy($src, $dst) === false) {
+			throw new WireException(
+				'ProcessWireReset: cannot copy repair.php to ' . $dst . '. '
+				. 'The PW document root must be writable for the webserver. '
+				. 'Either grant write access for the duration of the install, '
+				. 'or copy the file manually before triggering the first reset.'
+			);
+		}
+		@chmod($dst, 0644);
+	}
+
+	/**
+	 * Remove the recovery endpoint when the module is uninstalled.
+	 */
+	public function ___uninstall() {
+		$dst = $this->wire('config')->paths->root . self::RECOVERY_SCRIPT;
+		if(is_file($dst)) @unlink($dst);
 	}
 
 	/**
@@ -522,7 +562,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$recoveryCopyBtn = $this->_('Copy');
 		$recoveryCopied  = $this->_('Copied');
 		$recoverySavedLb = $this->_('I saved the recovery URL');
-		$recoveryUrlBase = $this->wire('config')->urls->siteModules . $this->className() . '/repair.php';
+		$recoveryUrlBase = $this->wire('config')->urls->root . self::RECOVERY_SCRIPT;
 
 		// Pre-compute transitive dependencies so JS can show them in the modal
 		$savedKeep = isset($data['keepModules']) ? (array) $data['keepModules'] : [];
@@ -804,6 +844,17 @@ HTMLMODAL;
 		if(!empty($errors)) {
 			foreach($errors as $e) $this->error("Pre-flight: $e");
 			throw new WireException('Reset aborted (filesystem check failed): ' . implode('; ', $errors));
+		}
+
+		// Recovery endpoint must be in place before we wipe anything,
+		// otherwise the URL shown in the confirmation modal is dead.
+		$recoveryScript = $config->paths->root . self::RECOVERY_SCRIPT;
+		if(!is_file($recoveryScript)) {
+			throw new WireException(
+				'Reset aborted: recovery endpoint not found at ' . $recoveryScript . '. '
+				. 'Re-install ProcessWireReset, or copy repair.php from the module '
+				. 'directory to ' . $recoveryScript . ' manually before retrying.'
+			);
 		}
 
 		// ── Phase 1: Backup ───────────────────────────────────────────────────
