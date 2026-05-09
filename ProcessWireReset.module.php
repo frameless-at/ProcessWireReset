@@ -59,11 +59,12 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			'author'   => 'frameless',
 			'icon'     => 'refresh',
 			'singular' => true,
-			// Only autoload when there are deferred tasks from a previous reset.
-			// Snapshot files are NOT a trigger — they are consumed on demand
-			// from the module config screen.
+			// Autoload when there are deferred installs to run, OR when a
+			// snapshot is available — the latter so we can prompt the
+			// superuser to look at it after the reset.
 			'autoload' => function() {
-				return file_exists(__DIR__ . '/' . self::PENDING_FILE);
+				return file_exists(__DIR__ . '/' . self::PENDING_FILE)
+				    || file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE);
 			},
 			'requires' => ['ProcessWire>=3.0.0'],
 		];
@@ -87,8 +88,32 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * Schedules processPendingInstalls() to run after PW is fully ready.
 	 */
 	public function init() {
-		if(!file_exists(__DIR__ . '/' . self::PENDING_FILE)) return;
-		$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
+		if(file_exists(__DIR__ . '/' . self::PENDING_FILE)) {
+			$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
+		}
+		if(file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) {
+			$this->addHookAfter('ProcessWire::ready', $this, 'announceSnapshot');
+		}
+	}
+
+	/**
+	 * Show a one-shot superuser notice on the admin dashboard pointing
+	 * at the snapshot restore UI, so the existence of a recoverable
+	 * backup isn't buried inside Modules → Configure.
+	 */
+	public function announceSnapshot() {
+		$page = $this->wire('page');
+		if(!$page || $page->process !== 'ProcessHome') return;
+		$user = $this->wire('user');
+		if(!$user || !$user->isSuperuser()) return;
+		if(!file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) return;
+
+		$editUrl = $this->wire('config')->urls->admin . 'module/edit?name=' . $this->className();
+		$msg = sprintf(
+			$this->_('A database snapshot from a previous reset is available. <a href="%s">Open ProcessWire Reset</a> to review and restore tables.'),
+			htmlspecialchars($editUrl, ENT_QUOTES, 'UTF-8')
+		);
+		$this->message($msg, Notice::allowMarkup);
 	}
 
 	/**
