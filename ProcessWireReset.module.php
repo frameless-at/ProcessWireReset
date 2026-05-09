@@ -109,8 +109,17 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	public function processPendingInstalls() {
 		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
+
+		// Capture any output produced by PW core or by module install()
+		// hooks during the deferred-install phase. PW 3.0.218+ for instance
+		// can raise "Undefined array key N" warnings out of ModulesFlags
+		// when a module entry exists in `modules` but not yet in the
+		// modules-flags cache — harmless to the install but fatal to the
+		// header()-based redirect at the end of this method.
+		ob_start();
 		if(!file_exists($pendingFile)) {
 			$this->processPendingCustomTables($this->wire('database'));
+			while(ob_get_level() > 0) ob_end_clean();
 			return;
 		}
 
@@ -124,6 +133,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 
 		if(!is_array($pending) || empty($pending)) {
 			$this->processPendingCustomTables($this->wire('database'));
+			while(ob_get_level() > 0) ob_end_clean();
 			return;
 		}
 
@@ -239,16 +249,33 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$config = $this->wire('config');
 		$adminUrl = $config->urls->admin;
 		$requestUrl = $this->wire('input')->url();
-		if(strpos((string) $requestUrl, (string) $adminUrl) !== 0) return;
+		if(strpos((string) $requestUrl, (string) $adminUrl) !== 0) {
+			while(ob_get_level() > 0) ob_end_clean();
+			return;
+		}
 
 		$location = $this->safeRedirectUrl($adminUrl);
+
+		// Discard any output captured during install/restore so the
+		// header() calls below see a clean stream.
+		while(ob_get_level() > 0) ob_end_clean();
+
+		if(headers_sent()) {
+			// Last-resort fallback: HTML redirect when something already
+			// echoed before this method took over (e.g. a startup hook
+			// firing earlier in the request than ob_start() above).
+			$h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
+			echo '<!doctype html><meta http-equiv="refresh" content="0;url=' . $h($location) . '">'
+				. '<script>location.replace(' . json_encode($location) . ');</script>';
+			exit;
+		}
+
 		header("Location: $location");
 		header("Connection: close");
 		header("Content-Length: 0");
 		if(function_exists('fastcgi_finish_request')) {
 			fastcgi_finish_request();
 		} else {
-			while(ob_get_level() > 0) ob_end_clean();
 			flush();
 		}
 		exit;
