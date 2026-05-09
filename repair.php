@@ -45,26 +45,10 @@ register_shutdown_function(function() {
 		. "line:    " . $err['line'] . "\n";
 });
 
-// ─── Stub config object ──────────────────────────────────────────────────
-// PW's config.php sets `$config->dbHost = ...` etc. on whatever object is
-// in scope. Magic accessors absorb any property the config touches without
-// us having to mirror PW's full Config class.
-class RepairConfigStub {
-	private $data = [
-		'dbPort'     => 3306,
-		'dbCharset'  => 'utf8',
-		'dbEngine'   => 'InnoDB',
-		'dbSocket'   => '',
-		'tableSalt'  => '',
-		'urls'       => null,
-		'paths'      => null,
-		'chmodDir'   => '0755',
-		'chmodFile'  => '0644',
-	];
-	public function __get($k)         { return $this->data[$k] ?? null; }
-	public function __set($k, $v)     { $this->data[$k] = $v; }
-	public function __isset($k)       { return isset($this->data[$k]); }
-}
+// (Previously used a magic-accessor stub object + require config.php.
+//  That blew up on hosts where config.php pulls in further files or
+//  hits a non-catchable fatal. We now lift the DB credentials with a
+//  regex over file_get_contents() — see step 2 below.)
 
 // ─── Constants ───────────────────────────────────────────────────────────
 const RECOVERY_STATE_FILE = 'recovery.state.php';
@@ -259,25 +243,46 @@ if(!is_file($profileSQL)) repair_fail('Profile install.sql missing: ' . $profile
 repair_step('Loading config.php…');
 if(!is_file($configPhp)) repair_fail('site/config.php not found at ' . $configPhp, 500);
 
-$config = new RepairConfigStub();
-try {
-	require $configPhp;
-} catch(\Throwable $e) {
-	repair_fail('config.php load failed: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine(), 500);
-}
-repair_step('config.php loaded.');
+// We do NOT require() config.php — some installations have config.php
+// pull in further files, call into PW classes, or otherwise crash a
+// stand-alone include in ways that bypass try/catch and the shutdown
+// handler (FastCGI stream abort). Lift the DB credentials with a
+// regex instead. Works for the (overwhelmingly common) case where
+// they are plain string / int literals.
+$configRaw = (string) @file_get_contents($configPhp);
+if($configRaw === '') repair_fail('config.php is empty or unreadable', 500);
 
-if(empty($config->dbHost) || empty($config->dbName) || empty($config->dbUser)) {
-	repair_fail('Database credentials missing in config.php', 500);
+$cfgVal = function($key, $default = null) use ($configRaw) {
+	$q = preg_quote($key, '/');
+	if(preg_match('/\$config->' . $q . '\s*=\s*([\'"])((?:\\\\.|(?!\1).)*)\1\s*;/s', $configRaw, $m)) {
+		return stripcslashes($m[2]);
+	}
+	if(preg_match('/\$config->' . $q . '\s*=\s*(\d+)\s*;/', $configRaw, $m)) {
+		return (int) $m[1];
+	}
+	return $default;
+};
+
+$dbHost    = (string) $cfgVal('dbHost');
+$dbName    = (string) $cfgVal('dbName');
+$dbUser    = (string) $cfgVal('dbUser');
+$dbPass    = (string) $cfgVal('dbPass', '');
+$dbPort    = (int)    $cfgVal('dbPort', 3306);
+$dbCharset = (string) $cfgVal('dbCharset', 'utf8');
+$dbEngine  = (string) $cfgVal('dbEngine', 'InnoDB');
+
+repair_step('Parsed credentials from config.php: ' . $dbUser . '@' . $dbHost . '/' . $dbName . ' (port ' . $dbPort . ', charset ' . $dbCharset . ', engine ' . $dbEngine . ')');
+
+if($dbHost === '' || $dbName === '' || $dbUser === '') {
+	repair_fail('Could not parse DB credentials out of config.php — they may be set conditionally or via constants. Open the file and confirm $config->dbHost / dbName / dbUser are simple literal assignments.', 500);
 }
 
-$dsn = 'mysql:host=' . $config->dbHost . ';dbname=' . $config->dbName
-	. ';port=' . (int) ($config->dbPort ?: 3306)
-	. ';charset=' . ($config->dbCharset ?: 'utf8');
-repair_step('Token verified, state file decoded.');
-repair_step('Connecting to database (' . $config->dbName . '@' . $config->dbHost . ')…');
+$dsn = 'mysql:host=' . $dbHost . ';dbname=' . $dbName
+	. ';port=' . $dbPort
+	. ';charset=' . $dbCharset;
+repair_step('Connecting to database…');
 try {
-	$pdo = new \PDO($dsn, (string) $config->dbUser, (string) $config->dbPass, [
+	$pdo = new \PDO($dsn, $dbUser, $dbPass, [
 		\PDO::ATTR_ERRMODE            => \PDO::ERRMODE_EXCEPTION,
 		\PDO::ATTR_EMULATE_PREPARES   => false,
 		\PDO::MYSQL_ATTR_FOUND_ROWS   => true,
@@ -325,7 +330,7 @@ function repair_drop_all(\PDO $pdo, $dbName) {
 
 repair_step('Dropping all tables…');
 try {
-	$remaining = repair_drop_all($pdo, $config->dbName);
+	$remaining = repair_drop_all($pdo, $dbName);
 	if($remaining > 0) repair_fail("Could not drop all tables ($remaining remain). Aborting.", 500);
 } catch(\PDOException $e) {
 	repair_fail('DROP TABLES failed: ' . $e->getMessage(), 500);
@@ -341,14 +346,14 @@ if(!class_exists('\\ProcessWire\\WireDatabaseBackup', false)) {
 }
 
 $replace = [
-	'ENGINE=InnoDB'         => 'ENGINE=' . ($config->dbEngine ?: 'InnoDB'),
-	'ENGINE=MyISAM'         => 'ENGINE=' . ($config->dbEngine ?: 'InnoDB'),
-	'CHARSET=utf8mb4;'      => 'CHARSET=' . ($config->dbCharset ?: 'utf8') . ';',
-	'CHARSET=utf8;'         => 'CHARSET=' . ($config->dbCharset ?: 'utf8') . ';',
-	'CHARSET=utf8 COLLATE=' => 'CHARSET=' . ($config->dbCharset ?: 'utf8') . ' COLLATE=',
+	'ENGINE=InnoDB'         => 'ENGINE=' . ($dbEngine ?: 'InnoDB'),
+	'ENGINE=MyISAM'         => 'ENGINE=' . ($dbEngine ?: 'InnoDB'),
+	'CHARSET=utf8mb4;'      => 'CHARSET=' . ($dbCharset ?: 'utf8') . ';',
+	'CHARSET=utf8;'         => 'CHARSET=' . ($dbCharset ?: 'utf8') . ';',
+	'CHARSET=utf8 COLLATE=' => 'CHARSET=' . ($dbCharset ?: 'utf8') . ' COLLATE=',
 ];
-if(strtolower((string) $config->dbCharset) === 'utf8mb4') {
-	if(strtolower((string) $config->dbEngine) === 'innodb') {
+if(strtolower($dbCharset) === 'utf8mb4') {
+	if(strtolower($dbEngine) === 'innodb') {
 		$replace['(255)'] = '(191)';
 		$replace['(250)'] = '(191)';
 	} else {
