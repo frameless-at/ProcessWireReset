@@ -128,7 +128,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$editUrl   = $h($this->wire('config')->urls->admin . 'module/edit?name=' . $this->className());
 		$title     = $h($this->_('Database snapshot available'));
 		$body      = $h($this->_('A reset created a backup of non-canonical tables.'));
-		$linkLabel = $h($this->_('Review & restore'));
+		$linkLabel = $h($this->_('Open snapshot'));
 
 		// UIkit-flavoured (AdminThemeUikit). Falls back gracefully on other
 		// themes — without UIkit the alert just renders as a plain block,
