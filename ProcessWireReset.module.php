@@ -119,20 +119,20 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$h        = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
 		$editUrl  = $h($this->wire('config')->urls->admin . 'module/edit?name=' . $this->className());
 		$title    = $h($this->_('Database snapshot available'));
-		$body     = $h($this->_('A reset created a backup of non-canonical tables. Open ProcessWire Reset to review and restore.'));
-		$btnLabel = $h($this->_('Open ProcessWire Reset'));
+		$body     = $h($this->_('A reset created a backup of non-canonical tables.'));
+		$btnLabel = $h($this->_('Review &amp; restore'));
 
-		$banner = '<div id="pwreset-snapshot-banner" style="'
-			. 'background:#fff8e1;border-bottom:2px solid #f59e0b;color:#7c2d12;'
-			. 'padding:.7em 1.2em;font:14px/1.4 system-ui,sans-serif;'
-			. 'display:flex;align-items:center;gap:1em;flex-wrap:wrap;'
-			. 'position:relative;z-index:1000;">'
-			. '<strong style="color:#92400e">' . $title . '</strong>'
-			. '<span style="flex:1">' . $body . '</span>'
-			. '<a href="' . $editUrl . '" style="'
-			. 'background:#92400e;color:#fff;padding:.4em .9em;border-radius:4px;'
-			. 'text-decoration:none;font-weight:600;white-space:nowrap;">'
-			. $btnLabel . '</a>'
+		// UIkit-flavoured (AdminThemeUikit). Falls back gracefully on other
+		// themes — without UIkit the alert just renders as a plain block,
+		// not pretty but still readable.
+		$banner = '<div id="pwreset-snapshot-banner" class="uk-alert uk-alert-warning"'
+			. ' style="margin:0;border-radius:0;padding:.6em 1.5em;'
+			. 'display:flex;align-items:center;gap:1em;flex-wrap:wrap;">'
+			. '<span uk-icon="icon: database" class="uk-margin-small-right"></span>'
+			. '<strong>' . $title . '</strong>'
+			. '<span class="uk-flex-1" style="flex:1">' . $body . '</span>'
+			. '<a class="uk-button uk-button-primary uk-button-small"'
+			. ' href="' . $editUrl . '">' . $btnLabel . '</a>'
 			. '</div>';
 
 		$event->return = preg_replace('/(<body\b[^>]*>)/i', '$1' . $banner, $out, 1);
@@ -475,6 +475,17 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 						$this->_n('Restored %d table: %s', 'Restored %d tables: %s', count($restored)),
 						count($restored), implode(', ', $restored)
 					));
+					// Drop restored tables from the snapshot so the banner
+					// reflects what's actually still available. Snapshot file
+					// is removed entirely once empty so the banner disappears.
+					foreach($restored as $tableName) {
+						unset($payload['tables'][$tableName]);
+					}
+					if(empty($payload['tables'])) {
+						$this->deleteCustomTablesSnapshot();
+					} else {
+						$this->writeCustomTablesSnapshotPayload($payload);
+					}
 				}
 			} catch(\Exception $e) {
 				$this->error($this->_('Restore failed: ') . $e->getMessage());
@@ -1560,25 +1571,30 @@ HTMLMODAL;
 	 * verbatim. Empty backups remove an existing snapshot file.
 	 */
 	protected function writeCustomTablesSnapshot(array $customTables, array $keepModules) {
-		$file = __DIR__ . '/' . self::SNAPSHOT_FILE;
-
 		if(empty($customTables)) {
-			if(file_exists($file)) @unlink($file);
+			$this->deleteCustomTablesSnapshot();
 			return;
 		}
-
-		$payload = [
+		$this->writeCustomTablesSnapshotPayload([
 			'version'      => 1,
 			'created_at'   => time(),
 			'keep_modules' => array_values($keepModules),
 			'tables'       => $customTables,
-		];
+		]);
+	}
+
+	/**
+	 * Write a pre-built snapshot payload to disk. Used both by the
+	 * initial snapshot (executeReset) and by the restore handler
+	 * after pruning already-restored tables out of the payload.
+	 */
+	protected function writeCustomTablesSnapshotPayload(array $payload) {
+		$file    = __DIR__ . '/' . self::SNAPSHOT_FILE;
 		$encoded = base64_encode(serialize($payload));
 		$body    = "<?php http_response_code(403); exit; ?>\n"
 			. "==SNAPSHOT BEGIN==\n"
 			. $encoded . "\n"
 			. "==SNAPSHOT END==\n";
-
 		if(file_put_contents($file, $body, LOCK_EX) === false) {
 			throw new WireException("Cannot write custom-tables snapshot: $file");
 		}
