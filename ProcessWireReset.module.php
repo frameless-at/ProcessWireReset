@@ -1287,19 +1287,37 @@ HTMLMODAL;
 	protected function backupCustomTables($database, array $canonicalTables) {
 		$backup     = [];
 		$allTables  = $database->query("SHOW TABLES")->fetchAll(\PDO::FETCH_COLUMN);
+		$modules    = $this->wire('modules');
+		$wirePath   = $this->wire('config')->paths->wire;
 
-		$registeredFields = [];
+		// Build name → fieldtype map and a "is core fieldtype" cache.
+		// PW-core field tables (e.g. field_admin_theme, added by SystemUpdater
+		// after install) survive any reset because the SystemUpdater recreates
+		// them — backing them up just adds noise to the snapshot UI.
+		$registeredFields  = [];
+		$coreFieldtypeFor  = [];
 		try {
-			$stmt = $database->query("SELECT name FROM fields");
-			while($name = $stmt->fetchColumn()) {
-				$registeredFields['field_' . $name] = true;
+			$stmt = $database->query("SELECT name, type FROM fields");
+			while($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+				$tbl = 'field_' . $row['name'];
+				$registeredFields[$tbl] = true;
+				$type = (string) $row['type'];
+				if(!isset($coreFieldtypeFor[$type])) {
+					$file = $modules ? $modules->getModuleFile($type) : '';
+					$coreFieldtypeFor[$type] = $file && strpos($file, $wirePath) === 0;
+				}
+				if($coreFieldtypeFor[$type]) {
+					// Mark this specific field-table as "skip from backup".
+					$registeredFields[$tbl] = 'core';
+				}
 			}
 		} catch(\PDOException $e) { /* fall through — back up everything */ }
 
 		foreach($allTables as $table) {
 			if(isset($canonicalTables[$table])) continue;
 			if(strpos($table, 'field_') === 0 && !empty($registeredFields)) {
-				if(!isset($registeredFields[$table])) continue;
+				if(!isset($registeredFields[$table])) continue;          // orphaned
+				if($registeredFields[$table] === 'core') continue;       // PW-core fieldtype
 			}
 			$create = $this->getCreateTable($database, $table);
 			if(empty($create)) continue;
@@ -1593,11 +1611,11 @@ HTMLMODAL;
 				$stmt->execute([':n' => $fieldName]);
 				$type = $stmt->fetchColumn();
 				if($type) {
-					return sprintf($this->_('Field "%s" (Fieldtype: %s)'), $fieldName, $type);
+					return sprintf($this->_('Field %s (Fieldtype: %s)'), $fieldName, $type);
 				}
-				return sprintf($this->_('Field "%s" (no longer registered)'), $fieldName);
+				return sprintf($this->_('Field %s (no longer registered)'), $fieldName);
 			} catch(\PDOException $e) {
-				return sprintf($this->_('Field "%s"'), $fieldName);
+				return sprintf($this->_('Field %s'), $fieldName);
 			}
 		}
 
