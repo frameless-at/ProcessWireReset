@@ -221,14 +221,23 @@ booleans about the snapshot state — without leaking absolute paths, PHP
 versions, or other reconnaissance-relevant data. Useful for verifying that
 the file is actually being served before triggering a real reset.
 
-## Test helper
+## Tests and dev material
 
-`tests/CrashTest/` contains a deliberately broken module used to exercise
-the recovery flow. The first `install()` call writes an arm marker into its
-own directory. The second `install()` call (i.e. the deferred re-install
-that runs after a reset) finds the marker and `die()`s — bypassing every
-catch block on the way and leaving `recovery.state.php` in place. See
-`TESTING.md` scenario S17 for the full walkthrough.
+Two artefacts live in the source repository but are **not** shipped in
+the distribution archive (they're marked `export-ignore` in
+`.gitattributes`, so `git archive` and modules.processwire.com tarballs
+omit them):
+
+- `TESTING.md` — manual test scenarios used to validate the module
+  after code changes. ~20 scenarios, including the recovery flow.
+- `tests/CrashTest/` — a deliberately broken helper module used to
+  exercise the recovery path. Its first `install()` writes a marker;
+  its second `install()` (the deferred re-install after a reset) finds
+  the marker and `die()`s, leaving `recovery.state.php` in place so
+  the recovery URL has something to consume. See `TESTING.md` scenario
+  S17 for the full walkthrough.
+
+Both are available when the module is cloned from its source repository.
 
 ## Security notes
 

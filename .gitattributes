@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Dev-only assets — kept in the repo for maintainers, excluded from
+# `git archive` so they don't ship in the distribution tarball pulled
+# by modules.processwire.com or by anyone running git archive HEAD.
+TESTING.md     export-ignore
+tests/         export-ignore
+.gitattributes export-ignore
