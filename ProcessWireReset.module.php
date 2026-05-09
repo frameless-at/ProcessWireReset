@@ -181,16 +181,32 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 					$modules->install($className);
 				} catch(\Exception $e) {
 					$msg = $e->getMessage();
-					// Check DB regardless — module may have been auto-installed
-					// as a dependency during install() before the exception fired.
 					$stmt2 = $database->prepare("SELECT id FROM modules WHERE class = :c");
 					$stmt2->execute([':c' => $className]);
-					if($stmt2->fetch()) {
-						// In DB = effectively installed (duplicate-entry or similar)
+					$row = $stmt2->fetch();
+					$isDuplicate = stripos($msg, 'duplicate') !== false;
+					if($row && $isDuplicate) {
+						// PW finished installing this class while resolving a
+						// dependency chain — DB row is consistent, treat as success.
 						$installed[$className] = true;
 						$progress = true;
 						$modules->refresh();
 					} else {
+						if($row) {
+							// install() inserted the modules row before throwing.
+							// Roll it back so the modules table stays consistent
+							// with modules_flags (PW 3.0.218+) and so that no
+							// "Undefined array key N" warning leaks from
+							// ModulesFlags on subsequent requests.
+							$id = (int) $row['id'];
+							$database->prepare("DELETE FROM modules WHERE id = :id")
+								->execute([':id' => $id]);
+							try {
+								$database->prepare("DELETE FROM modules_flags WHERE modules_id = :id")
+									->execute([':id' => $id]);
+							} catch(\PDOException $e2) { /* table absent on older PW */ }
+							$modules->refresh();
+						}
 						$nextRemaining[]    = $className;
 						$failed[$className] = $msg;
 					}
