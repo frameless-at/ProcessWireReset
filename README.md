@@ -287,6 +287,23 @@ booleans about the snapshot state — without leaking absolute paths, PHP
 versions, or other reconnaissance-relevant data. Useful for verifying that
 the file is actually being served before triggering a real reset.
 
+## Caveats: PW upgrades
+
+The module bundles a frozen `site-blank` `install.sql`. At reset time
+it merges that with the live `wire/core/install.sql` to recreate the
+database. If you upgrade ProcessWire between resets, the bundled
+profile and the new core can drift apart.
+
+- Minor PW upgrades usually pass — `SystemUpdater` patches the gap.
+- Larger jumps may hit foreign-key conflicts the updater can't fix.
+- Kept modules built against older APIs can fatal during the deferred
+  re-install — that's what the recovery URL is for.
+
+After any non-trivial PW upgrade, run a reset on a disposable install
+first. If it fails, point **Custom Profile Path** at an `install.sql`
+exported from your current PW version — that decouples the reset
+from whatever the module shipped.
+
 ## Tests and dev material
 
 Two artefacts live in the source repository but are **not** shipped in
