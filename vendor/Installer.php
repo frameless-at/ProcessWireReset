@@ -19,7 +19,12 @@
  * 
  */
 
-define("PROCESSWIRE_INSTALL", "3.x"); 
+// PROCESSWIRE_INSTALL define removed: this file is included as a library
+// inside a live PW request (via InstallerCore), and setting that global
+// constant would flip ProcessWire and other modules into "we are running
+// the installer" mode for the rest of the request — wrong logging level,
+// auth shortcuts in some hooks, surprise behavior. The constant was only
+// used in execute() for the HTML page title (replaced inline below).
 
 /**
  * class Installer
@@ -96,7 +101,8 @@ class Installer {
 		}
 
 		// these two vars used by install-head.inc
-		$title = "ProcessWire " . PROCESSWIRE_INSTALL . " Installer";
+		// (formerly: "ProcessWire " . PROCESSWIRE_INSTALL . " Installer")
+		$title = "ProcessWire 3.x Installer";
 		$formAction = "./install.php";
 		$step = $this->post('step');
 		
