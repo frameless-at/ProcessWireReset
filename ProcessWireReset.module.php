@@ -221,10 +221,19 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// request to finish any remaining core DB upgrades (e.g. field_admin_theme).
 		// Without this bounce, Update #10 runs on the same request as the login
 		// page, potentially leaving the form partially unstyled.
+		//
+		// Only redirect from inside the admin: the hook fires on every request
+		// while pending files exist, including frontend pages and AJAX/API calls
+		// where a hidden Location: header would clobber the response.
 		// Safe from infinite loops: pending file is already deleted above, so the
 		// module will not autoload on the next request and no redirect fires again.
-		$adminUrl = $this->safeRedirectUrl($this->wire('config')->urls->admin);
-		header("Location: $adminUrl");
+		$config = $this->wire('config');
+		$adminUrl = $config->urls->admin;
+		$requestUrl = $this->wire('input')->url();
+		if(strpos((string) $requestUrl, (string) $adminUrl) !== 0) return;
+
+		$location = $this->safeRedirectUrl($adminUrl);
+		header("Location: $location");
 		header("Connection: close");
 		header("Content-Length: 0");
 		if(function_exists('fastcgi_finish_request')) {
