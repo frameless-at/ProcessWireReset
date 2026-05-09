@@ -21,22 +21,18 @@ afterwards.
 - **Site profile validation.** When building a custom site profile,
   verify it cleanly installs and runs end-to-end by repeatedly
   resetting against it.
-- **Demo / sandbox installations.** Public demo sites that need to be
-  back to a known state on a schedule. Trigger the reset from a cron
-  job or a post-tutorial hook.
 - **Domain recycling.** Reuse an existing PW installation (DB, host,
   config) for a new project without redoing the install dance —
   reset to a fresh profile and start over.
 - **Cleanup after stress / load tests.** Drop the bulk pages, files
   and modules a test run created and return to a baseline.
-- **CI workflows.** Reset before each test job so every run starts from
-  the same clean slate. Can be paired with a profile that pre-seeds
-  the fixtures the test suite expects.
 
-These are the situations the PW community has historically reached
-for; the reset is also useful any time "uninstall everything except
-my superuser and these N modules, then start fresh" describes the
-goal more accurately than reinstalling PW from scratch.
+The reset is useful any time "uninstall everything except my
+superuser and these N modules, then start fresh" describes the goal
+more accurately than reinstalling PW from scratch. It is **not**
+suitable for fully unattended scenarios (cron-triggered demo
+resets, CI pipelines) — the flow requires a confirmation modal and
+the user copying the recovery URL before the destructive phase.
 
 ---
 
