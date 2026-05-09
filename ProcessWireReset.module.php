@@ -92,28 +92,50 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
 		}
 		if(file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) {
-			$this->addHookAfter('ProcessWire::ready', $this, 'announceSnapshot');
+			$this->addHookAfter('Page::render', $this, 'injectSnapshotBanner');
 		}
 	}
 
 	/**
-	 * Show a one-shot superuser notice on the admin dashboard pointing
-	 * at the snapshot restore UI, so the existence of a recoverable
-	 * backup isn't buried inside Modules → Configure.
+	 * Inject a sticky banner at the top of every admin page while a
+	 * snapshot is available. Notices are no good for this — PW collapses
+	 * them by default, and a hook that fires on multiple sub-requests
+	 * piles up identical messages that nobody reads.
 	 */
-	public function announceSnapshot() {
-		$page = $this->wire('page');
-		// if(!$page || $page->process !== 'ProcessHome') return;
-		$user = $this->wire('user');
-		// if(!$user || !$user->isSuperuser()) return;
-		// if(!file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) return;
+	public function injectSnapshotBanner(HookEvent $event) {
+		$page = $event->object;
+		if(!$page || !$page->template || $page->template->name !== 'admin') return;
 
-		$editUrl = $this->wire('config')->urls->admin . 'module/edit?name=' . $this->className();
-		$msg = sprintf(
-			$this->_('A database snapshot from a previous reset is available. <a href="%s">Open ProcessWire Reset</a> to review and restore tables.'),
-			htmlspecialchars($editUrl, ENT_QUOTES, 'UTF-8')
-		);
-		$this->message($msg, Notice::allowMarkup);
+		$user = $this->wire('user');
+		if(!$user || !$user->isSuperuser()) return;
+
+		if(!file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) return;
+
+		$out = (string) $event->return;
+		// Only touch real HTML responses — skip AJAX / fragment / file
+		// downloads where there is no <body> to inject into.
+		if(stripos($out, '<body') === false) return;
+
+		$h        = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
+		$editUrl  = $h($this->wire('config')->urls->admin . 'module/edit?name=' . $this->className());
+		$title    = $h($this->_('Database snapshot available'));
+		$body     = $h($this->_('A reset created a backup of non-canonical tables. Open ProcessWire Reset to review and restore.'));
+		$btnLabel = $h($this->_('Open ProcessWire Reset'));
+
+		$banner = '<div id="pwreset-snapshot-banner" style="'
+			. 'background:#fff8e1;border-bottom:2px solid #f59e0b;color:#7c2d12;'
+			. 'padding:.7em 1.2em;font:14px/1.4 system-ui,sans-serif;'
+			. 'display:flex;align-items:center;gap:1em;flex-wrap:wrap;'
+			. 'position:relative;z-index:1000;">'
+			. '<strong style="color:#92400e">' . $title . '</strong>'
+			. '<span style="flex:1">' . $body . '</span>'
+			. '<a href="' . $editUrl . '" style="'
+			. 'background:#92400e;color:#fff;padding:.4em .9em;border-radius:4px;'
+			. 'text-decoration:none;font-weight:600;white-space:nowrap;">'
+			. $btnLabel . '</a>'
+			. '</div>';
+
+		$event->return = preg_replace('/(<body\b[^>]*>)/i', '$1' . $banner, $out, 1);
 	}
 
 	/**
