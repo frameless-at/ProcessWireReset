@@ -125,10 +125,16 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		if(stripos($out, '<body') === false) return;
 
 		$h         = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
+		// editUrl is unconditionally raw user-provided-style text → escape it.
+		// Title / body / link label come from $this->_() which PW already
+		// runs through its own entity layer. Double-escaping here turned
+		// "Review & restore" into the visible text "Review &amp; restore".
+		// Trust the pipeline for translated strings; escape only what we
+		// know is unsafe.
 		$editUrl   = $h($this->wire('config')->urls->admin . 'module/edit?name=' . $this->className());
-		$title     = $h($this->_('Database snapshot available'));
-		$body      = $h($this->_('A reset created a backup of non-canonical tables.'));
-		$linkLabel = $h($this->_('Open snapshot'));
+		$title     = $this->_('Database snapshot available');
+		$body      = $this->_('A reset created a backup of non-canonical tables.');
+		$linkLabel = $this->_('Review & restore');
 
 		// UIkit-flavoured (AdminThemeUikit). Falls back gracefully on other
 		// themes — without UIkit the alert just renders as a plain block,
