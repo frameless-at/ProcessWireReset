@@ -117,20 +117,15 @@ What is **not** preserved:
 
 ## Recovery
 
-If a reset leaves the installation in an inconsistent state, the bundled
-`repair.php` script can fix the most common issues:
+If a reset leaves the installation in an inconsistent state, restore from a
+database backup. Always take a fresh dump (`mysqldump` or PW's
+`ProcessDatabaseBackups` module) before running a reset on a site you cannot
+afford to lose.
 
-```
-https://your-site.example/path-to-pw/repair.php?mode=check
-```
-
-Modes:
-- `?mode=check` — show DB status, table schemas, user pages
-- `?mode=fix` — restore missing `field_permissions` / `field_roles` rows
-- `?mode=password&user=USERNAME&pass=NEWPASS` — set a fresh bcrypt hash for
-  the superuser using the site's `userAuthSalt`
-
-**Delete `repair.php` after use.**
+If no backup is available, the bundled `install/install.sql` together with
+`wire/core/install.sql` can be re-imported manually with `mysql` to obtain a
+fresh PW database; the superuser password then has to be re-hashed by hand
+using PHP's `crypt()` with the site's `$config->userAuthSalt`.
 
 ## Security notes
 

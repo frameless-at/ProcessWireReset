@@ -441,8 +441,8 @@ tail -f site/assets/logs/errors.txt
 
 ## S16 — Reset failure recovery
 
-**Goal:** Verify that a failed reset leaves the installation recoverable via
-`repair.php`.
+**Goal:** Verify that a failed reset aborts cleanly and leaves no partial state
+that would block a subsequent recovery from a database backup.
 
 **Simulate failure:**
 - Manually create a table that cannot be dropped (e.g. by revoking DROP
@@ -453,8 +453,7 @@ tail -f site/assets/logs/errors.txt
 - `dropAllTables()` throws `WireException` after exhausting retries
 - `executeReset()` catches the exception, clears any partial pending files
 - User sees a clear error message
-- `repair.php?mode=check` can diagnose the state
-- `repair.php?mode=password&user=...&pass=...` can reset credentials
+- A `mysqldump` taken before the reset can be restored without conflicts
 
 ---
 
@@ -477,7 +476,7 @@ tail -f site/assets/logs/errors.txt
 | S13      | Consecutive reset state cleanup                         |
 | S14      | POST-authoritative keepModules (regression)             |
 | S15      | Performance under load                                  |
-| S16      | Error recovery via repair.php                           |
+| S16      | Error recovery from database backup                     |
 
 ## Minimum smoke test
 
