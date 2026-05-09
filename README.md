@@ -117,15 +117,36 @@ What is **not** preserved:
 
 ## Recovery
 
-If a reset leaves the installation in an inconsistent state, restore from a
-database backup. Always take a fresh dump (`mysqldump` or PW's
-`ProcessDatabaseBackups` module) before running a reset on a site you cannot
-afford to lose.
+A reset can crash mid-way — typically because one of the kept modules
+throws inside its own `install()`. To make recovery a one-click operation,
+the module ships with a stand-alone `repair.php` endpoint:
 
-If no backup is available, the bundled `install/install.sql` together with
-`wire/core/install.sql` can be re-imported manually with `mysql` to obtain a
-fresh PW database; the superuser password then has to be re-hashed by hand
-using PHP's `crypt()` with the site's `$config->userAuthSalt`.
+1. **Before** the wipe runs, the confirmation modal shows a one-time
+   **Recovery URL** with a fresh random token. The user must tick
+   *"I saved the recovery URL"* before the reset can proceed.
+2. The same token (bcrypt-hashed) plus the captured superuser
+   credentials are written to `recovery.state.php` in the module
+   directory. The file uses a `<?php exit;` wrapper and is `chmod 0600`;
+   defense-in-depth deny rules live in `.htaccess`.
+3. If the reset finishes successfully (including any deferred module
+   installs), `recovery.state.php` is auto-deleted. The token expires
+   after 24 h regardless.
+4. If anything crashes, opening the saved Recovery URL invokes
+   `repair.php`. The endpoint:
+   - runs **without** a working ProcessWire bootstrap (raw PDO + the
+     site's `config.php`),
+   - drops every remaining table, re-imports `wire/core/install.sql`
+     and the bundled `site-blank/install.sql`,
+   - restores the **original** superuser name, email, password hash and
+     admin theme,
+   - **does not** re-install any custom modules — a deliberate choice,
+     since a misbehaving module is the most common crash cause,
+   - deletes the recovery state and any pending-task files on success.
+
+After repair the site is at the bundled default profile with the
+familiar admin login. Custom templates, fields and modules need to be
+restored separately (from version control, a profile, or a database
+dump if you took one).
 
 ## Security notes
 

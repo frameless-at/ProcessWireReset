@@ -32,6 +32,15 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/** Pending custom-table-restore file */
 	const PENDING_TABLES_FILE = '.pending-custom-tables.bin';
 
+	/** Recovery state file consumed by repair.php when a reset crashes */
+	const RECOVERY_STATE_FILE = 'recovery.state.php';
+
+	/** Recovery token lifetime in seconds (24 h) */
+	const RECOVERY_TTL = 86400;
+
+	/** Recovery token byte length (32 bytes → 64 hex chars) */
+	const RECOVERY_TOKEN_BYTES = 32;
+
 	/** @var string[] Filesystem operation failures collected during Phase 3 */
 	protected $fsFailures = [];
 
@@ -254,7 +263,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	protected function processPendingCustomTables($database) {
 		$file = __DIR__ . '/' . self::PENDING_TABLES_FILE;
-		if(!file_exists($file)) return;
+		if(!file_exists($file)) {
+			$this->cleanupRecoveryState();
+			return;
+		}
 
 		$raw = file_get_contents($file);
 		if(!unlink($file)) {
@@ -273,6 +285,9 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		} catch(\Exception $e) {
 			$this->wire('log')->error('ProcessWireReset: table restore failed: ' . $e->getMessage());
 		}
+
+		// Last step of the deferred-task chain — token can expire now.
+		$this->cleanupRecoveryState();
 	}
 
 	// =========================================================================
@@ -458,6 +473,13 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$defaultLabel = $this->_('Bundled default (site-blank)');
 		$confirmText  = self::CONFIRM_TEXT;
 
+		$recoveryHeader  = $this->_('Recovery URL — copy now');
+		$recoveryHelp    = $this->_('If the reset crashes, this is the only way back. Calling it performs a clean default install with your current admin credentials. The URL is shown once and is not recoverable.');
+		$recoveryCopyBtn = $this->_('Copy');
+		$recoveryCopied  = $this->_('Copied');
+		$recoverySavedLb = $this->_('I saved the recovery URL');
+		$recoveryUrlBase = $this->wire('config')->urls->siteModules . $this->className() . '/repair.php';
+
 		// Pre-compute transitive dependencies so JS can show them in the modal
 		$savedKeep = isset($data['keepModules']) ? (array) $data['keepModules'] : [];
 		$expanded  = $this->expandKeepModules($savedKeep);
@@ -482,18 +504,33 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				<tr><th>{$dirsLabel}</th><td id="pwreset-summary-dirs"></td></tr>
 				<tr style="border-bottom:none"><th>{$chmodLabel}</th><td id="pwreset-summary-chmod"></td></tr>
 			</table>
+			<div class="uk-alert uk-alert-warning uk-margin-top">
+				<h4 class="uk-margin-remove-bottom">{$recoveryHeader}</h4>
+				<p class="uk-margin-small-top uk-margin-small-bottom">{$recoveryHelp}</p>
+				<div class="uk-inline uk-width-1-1">
+					<a class="uk-form-icon uk-form-icon-flip" href="#" id="pwreset-recovery-copy"
+					   uk-icon="icon: copy" title="{$recoveryCopyBtn}"></a>
+					<input type="text" class="uk-input" id="pwreset-recovery-url"
+					       readonly onclick="this.select(); this.setSelectionRange(0, 99999);">
+				</div>
+				<label class="uk-margin-small-top uk-display-block">
+					<input type="checkbox" class="uk-checkbox" id="pwreset-recovery-saved">
+					{$recoverySavedLb}
+				</label>
+			</div>
 		</div>
 		<div class="uk-modal-footer uk-text-right">
 			<button type="button" class="uk-button uk-button-secondary uk-modal-close">{$cancelLabel}</button>
-			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-default">
+			<button type="button" id="pwreset-confirm-btn" class="uk-button uk-button-default" disabled>
 				<i class="fa fa-refresh"></i> {$btnLabel}
 			</button>
 		</div>
 	</div>
 </div>
 
-<input type="hidden" name="submit_reset" id="pwreset-hidden-submit" value="" disabled>
-<input type="hidden" name="confirmReset" id="pwreset-hidden-confirm" value="" disabled>
+<input type="hidden" name="submit_reset"   id="pwreset-hidden-submit"   value="" disabled>
+<input type="hidden" name="confirmReset"   id="pwreset-hidden-confirm"  value="" disabled>
+<input type="hidden" name="recoveryToken"  id="pwreset-hidden-token"    value="" disabled>
 
 
 <script>
@@ -502,10 +539,15 @@ document.addEventListener('DOMContentLoaded', function() {
 	var confirmBtn = document.getElementById('pwreset-confirm-btn');
 	var hiddenSubmit = document.getElementById('pwreset-hidden-submit');
 	var hiddenConfirm = document.getElementById('pwreset-hidden-confirm');
+	var hiddenToken = document.getElementById('pwreset-hidden-token');
+	var recoveryUrlInput = document.getElementById('pwreset-recovery-url');
+	var recoverySaved = document.getElementById('pwreset-recovery-saved');
+	var recoveryCopyBtn = document.getElementById('pwreset-recovery-copy');
 	var modal = document.getElementById('pwreset-modal');
 	var defaultProfile = '{$defaultLabel}';
 	var noneText = '{$noneLabel}';
 	var confirmText = '{$confirmText}';
+	var recoveryUrlBase = '{$recoveryUrlBase}';
 	var confirmed = false;
 	var precomputedDeps = {$depsJson};
 
@@ -514,9 +556,32 @@ document.addEventListener('DOMContentLoaded', function() {
 	var form = checkbox.closest('form');
 	if (!form) return;
 
+	function generateToken() {
+		var bytes = new Uint8Array(32);
+		(window.crypto || window.msCrypto).getRandomValues(bytes);
+		return Array.prototype.map.call(bytes, function(b) {
+			return ('0' + b.toString(16)).slice(-2);
+		}).join('');
+	}
+
+	function buildRecoveryUrl(token) {
+		var base = recoveryUrlBase;
+		if (base.indexOf('://') === -1) {
+			base = window.location.origin + base;
+		}
+		return base + '?token=' + token;
+	}
+
 	form.addEventListener('submit', function(e) {
 		if (!checkbox.checked || confirmed) return;
 		e.preventDefault();
+
+		// Fresh token + URL on every modal open
+		var token = generateToken();
+		recoveryUrlInput.value = buildRecoveryUrl(token);
+		hiddenToken.value = token;
+		recoverySaved.checked = false;
+		confirmBtn.disabled = true;
 
 		// Profile
 		var profileInput = form.querySelector('[name=profilePath]');
@@ -587,13 +652,41 @@ document.addEventListener('DOMContentLoaded', function() {
 		UIkit.modal(modal).show();
 	});
 
+	// Recovery-saved checkbox gates the execute button
+	recoverySaved.addEventListener('change', function() {
+		confirmBtn.disabled = !recoverySaved.checked;
+	});
+
+	// Click-to-copy
+	recoveryCopyBtn.addEventListener('click', function(e) {
+		e.preventDefault();
+		recoveryUrlInput.select();
+		recoveryUrlInput.setSelectionRange(0, 99999);
+		var copied = false;
+		try {
+			if (navigator.clipboard && navigator.clipboard.writeText) {
+				navigator.clipboard.writeText(recoveryUrlInput.value);
+				copied = true;
+			} else {
+				copied = document.execCommand('copy');
+			}
+		} catch(_) {}
+		if (copied) {
+			var orig = recoveryCopyBtn.getAttribute('title') || '';
+			recoveryCopyBtn.setAttribute('title', '{$recoveryCopied}');
+			setTimeout(function() { recoveryCopyBtn.setAttribute('title', orig); }, 1500);
+		}
+	});
+
 	// Confirm: enable hidden fields, set flag, re-submit
 	confirmBtn.addEventListener('click', function() {
+		if (!recoverySaved.checked) return;
 		confirmed = true;
 		hiddenSubmit.value = '1';
 		hiddenSubmit.disabled = false;
 		hiddenConfirm.value = confirmText;
 		hiddenConfirm.disabled = false;
+		hiddenToken.disabled = false;
 		UIkit.modal(modal).hide();
 		form.submit();
 	});
@@ -678,6 +771,19 @@ HTMLMODAL;
 
 		if(!is_file($coreSQL))    throw new WireException("Core install.sql not found: $coreSQL");
 		if(!$profileSQL || !is_file($profileSQL)) throw new WireException("Profile install.sql not found.");
+
+		// Persist recovery state BEFORE the wipe begins. repair.php uses this
+		// to perform a clean default install (always against bundled
+		// site-blank, never the custom profile, and without keepModules) if
+		// any subsequent phase crashes. Token comes from a hidden form field
+		// generated by JS and shown in the confirmation modal.
+		$recoveryToken = (string) $input->post('recoveryToken');
+		if(!preg_match('/^[a-f0-9]{40,128}$/', $recoveryToken)) {
+			throw new WireException('Reset aborted: missing or malformed recovery token.');
+		}
+		$bundledProfileSQL = __DIR__ . '/install/install.sql';
+		if(!is_file($bundledProfileSQL)) $bundledProfileSQL = $profileSQL;
+		$this->writeRecoveryState($recoveryToken, $superuser, $coreSQL, $bundledProfileSQL);
 
 		$keepModuleDirs      = $this->resolveKeepModuleDirs(['keepModules' => $keepModules]);
 		$profileTemplatesPath = $this->resolveProfileTemplatesPath(['profilePath' => $profilePath]);
@@ -1641,5 +1747,56 @@ HTMLMODAL;
 			\Tracy\Debugger::enable(\Tracy\Debugger::ProductionMode);
 		}
 		while(ob_get_level() > 0) ob_end_clean();
+	}
+
+	// =========================================================================
+	// Recovery state — written before wipe, consumed by repair.php on crash
+	// =========================================================================
+
+	/**
+	 * Write the recovery state file used by repair.php to perform a
+	 * standard install with the original superuser credentials if the
+	 * current reset crashes.
+	 *
+	 * The file is a PHP wrapper that exits 403 on direct HTTP access; the
+	 * payload (base64-encoded JSON) sits between markers in the body so
+	 * even a misconfigured webserver that ignores the .htaccess won't leak
+	 * it via curl/wget.
+	 */
+	protected function writeRecoveryState($token, array $superuser, $coreSQL, $profileSQL) {
+		$payload = [
+			'version'     => 1,
+			'token_hash'  => password_hash((string) $token, PASSWORD_BCRYPT),
+			'created_at'  => time(),
+			'expires_at'  => time() + self::RECOVERY_TTL,
+			'superuser'   => $superuser,
+			'core_sql'    => (string) $coreSQL,
+			'profile_sql' => (string) $profileSQL,
+		];
+		$encoded = base64_encode((string) json_encode($payload));
+		$body    = "<?php http_response_code(403); exit; ?>\n"
+			. "==RECOVERY-STATE==\n"
+			. $encoded . "\n"
+			. "==RECOVERY-STATE==\n";
+
+		$path = __DIR__ . '/' . self::RECOVERY_STATE_FILE;
+		if(file_put_contents($path, $body, LOCK_EX) === false) {
+			throw new WireException("Could not write recovery state file: $path");
+		}
+		@chmod($path, 0600);
+	}
+
+	/**
+	 * Delete the recovery state file once a reset (incl. deferred installs)
+	 * has finished without leaving any pending tasks behind. Called from
+	 * processPendingInstalls() and processPendingCustomTables() at their
+	 * respective tail ends.
+	 */
+	protected function cleanupRecoveryState() {
+		$pending  = __DIR__ . '/' . self::PENDING_FILE;
+		$tables   = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+		$recovery = __DIR__ . '/' . self::RECOVERY_STATE_FILE;
+		if(file_exists($pending) || file_exists($tables)) return;
+		if(file_exists($recovery)) @unlink($recovery);
 	}
 }
