@@ -525,7 +525,12 @@ superuser credentials.
    "successfully" — defeating the test.
 
 **Expected (failure phase):**
-- The browser shows a partial / broken admin page or the `die()` message.
+- The browser displays a plain page with the literal text:
+  `CrashTest: armed re-install fatal triggered for repair.php testing.`
+  (the die() message). No admin chrome, no styling — `processPendingInstalls()`
+  ran inside `ob_start()`, the buffer flushed on script termination, the
+  Login-page render never happened. Status code is 200 (PW already sent
+  headers before the ready hook ran).
 - `site/modules/ProcessWireReset/recovery.state.php` exists.
 - `.pending-installs.json` is gone (deleted at the top of
   `processPendingInstalls()` via the atomic-rename claim — that's expected).
