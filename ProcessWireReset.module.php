@@ -1007,43 +1007,9 @@ HTMLMODAL;
 				$this->wire('log')->save('processwirereset', 'admin_theme skipped: ' . $e->getMessage());
 			}
 
-			// 2h. AdminThemeUikit — fully restore before redirect (synchronous, not deferred).
-			// The profile install.sql only seeds AdminThemeDefault, so Uikit is not in
-			// the fresh modules table. INSERT if missing, UPDATE if present.
-			// Backup data (flags + user settings) is merged in both branches so that
-			// writePendingInstalls can safely exclude AdminThemeUikit — there is no
-			// need for a deferred restore and deferring it would clobber useAsLogin=1.
-			try {
-				$stmt = $database->prepare("SELECT data, flags FROM modules WHERE class = 'AdminThemeUikit'");
-				$stmt->execute();
-				$row    = $stmt->fetch(\PDO::FETCH_ASSOC);
-				$backup = $keptModuleData['AdminThemeUikit'] ?? null;
-
-				// Prefer backed-up user settings; fall back to fresh-DB data
-				if($backup && (string) $backup['data'] !== '') {
-					$d = json_decode($backup['data'], true);
-				} elseif($row && (string) $row['data'] !== '') {
-					$d = json_decode($row['data'], true);
-				} else {
-					$d = [];
-				}
-				if(!is_array($d)) $d = [];
-				$d['useAsLogin'] = 1;
-
-				if($row !== false) {
-					$flags = $backup ? (int) $backup['flags'] : (int) $row['flags'];
-					$database->prepare(
-						"UPDATE modules SET data = :data, flags = :flags WHERE class = 'AdminThemeUikit'"
-					)->execute([':data' => json_encode($d), ':flags' => $flags]);
-				} else {
-					$flags = $backup ? (int) $backup['flags'] : 2;
-					$database->prepare(
-						"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
-					)->execute([':class' => 'AdminThemeUikit', ':flags' => $flags, ':data' => json_encode($d)]);
-				}
-			} catch(\Exception $e) {
-				$this->wire('log')->save('processwirereset', 'useAsLogin skipped: ' . $e->getMessage());
-			}
+			// 2h. AdminThemeUikit — fully restore synchronously, not deferred,
+			// so the redirect target (admin login) renders with a working theme.
+			$this->restoreAdminThemeUikit($database, $keptModuleData);
 
 			// 2i. Re-register ProcessWireReset in the fresh modules table
 			$this->restoreSelfModule($database, $keptModuleData);
@@ -1859,6 +1825,52 @@ HTMLMODAL;
 	}
 
 	/**
+	 * Restore AdminThemeUikit's modules-table row using the captured backup.
+	 *
+	 * The fresh profile install.sql only seeds AdminThemeDefault, so Uikit
+	 * is missing in the post-import modules table. Re-installing it via the
+	 * deferred install loop would happen too late — the redirect lands on
+	 * the admin login page first, and a missing/inactive Uikit theme leaves
+	 * that page unstyled. So we INSERT/UPDATE Uikit synchronously inside
+	 * Phase 2, with merged settings (backed-up data + useAsLogin=1).
+	 *
+	 * Called from executeReset() Phase 2h.
+	 */
+	protected function restoreAdminThemeUikit($database, array $keptModuleData) {
+		try {
+			$stmt = $database->prepare("SELECT data, flags FROM modules WHERE class = 'AdminThemeUikit'");
+			$stmt->execute();
+			$row    = $stmt->fetch(\PDO::FETCH_ASSOC);
+			$backup = $keptModuleData['AdminThemeUikit'] ?? null;
+
+			// Prefer backed-up user settings; fall back to fresh-DB data.
+			if($backup && (string) $backup['data'] !== '') {
+				$d = json_decode($backup['data'], true);
+			} elseif($row && (string) $row['data'] !== '') {
+				$d = json_decode($row['data'], true);
+			} else {
+				$d = [];
+			}
+			if(!is_array($d)) $d = [];
+			$d['useAsLogin'] = 1;
+
+			if($row !== false) {
+				$flags = $backup ? (int) $backup['flags'] : (int) $row['flags'];
+				$database->prepare(
+					"UPDATE modules SET data = :data, flags = :flags WHERE class = 'AdminThemeUikit'"
+				)->execute([':data' => json_encode($d), ':flags' => $flags]);
+			} else {
+				$flags = $backup ? (int) $backup['flags'] : 2;
+				$database->prepare(
+					"INSERT INTO modules (class, flags, data, created) VALUES (:class, :flags, :data, NOW())"
+				)->execute([':class' => 'AdminThemeUikit', ':flags' => $flags, ':data' => json_encode($d)]);
+			}
+		} catch(\Exception $e) {
+			$this->wire('log')->save('processwirereset', 'useAsLogin skipped: ' . $e->getMessage());
+		}
+	}
+
+	/**
 	 * Disable debug-tool autoload modules and suppress error output.
 	 * Prevents Tracy/similar shutdown handlers from fataling when their files
 	 * are deleted during Phase 3.
@@ -1868,7 +1880,20 @@ HTMLMODAL;
 		ini_set('display_errors', '0');
 		if(class_exists('\Tracy\Debugger', false)) {
 			\Tracy\Debugger::$showBar = false;
-			\Tracy\Debugger::enable(\Tracy\Debugger::ProductionMode);
+			// Tracy renamed the production-mode constant in 2.10:
+			//   ≥ 2.10  → \Tracy\Debugger::ProductionMode  (CamelCase)
+			//   <  2.10 → \Tracy\Debugger::PRODUCTION       (uppercase)
+			// Reading whichever is present, with a literal int fallback so
+			// the silencing path itself never throws an Undefined-constant
+			// error during the very phase that needs it most.
+			if(defined('\Tracy\Debugger::ProductionMode')) {
+				$mode = \Tracy\Debugger::ProductionMode;
+			} elseif(defined('\Tracy\Debugger::PRODUCTION')) {
+				$mode = \Tracy\Debugger::PRODUCTION;
+			} else {
+				$mode = 1; // Tracy's internal value for production
+			}
+			\Tracy\Debugger::enable($mode);
 		}
 		while(ob_get_level() > 0) ob_end_clean();
 	}
