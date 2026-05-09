@@ -148,6 +148,25 @@ familiar admin login. Custom templates, fields and modules need to be
 restored separately (from version control, a profile, or a database
 dump if you took one).
 
+### Hosting-provider 403 on repair.php
+
+Some shared-hosting setups (deny `.php` execution under `site/modules/`
+via a server-level rule, restrictive `AllowOverride`, or mod_security)
+return 403 for the recovery URL even though the bundled `.htaccess`
+tries to whitelist `repair.php`. The fix is one extra step:
+
+1. After installing the module, copy `repair.php` from
+   `site/modules/ProcessWireReset/` into your PW document root
+   (the directory that contains `index.php`).
+2. Use the alternative URL when triggering recovery:
+   `https://your-site.tld/repair.php?token=…` (instead of
+   `…/site/modules/ProcessWireReset/repair.php?token=…`).
+
+`repair.php` walks up the directory tree until it finds
+`site/config.php` and `wire/core/install.sql`, so it works from
+either location. The state file always stays inside the module
+directory.
+
 ## Security notes
 
 - The module is non-autoload by default and only acts on POST submissions to

@@ -46,11 +46,36 @@ const PENDING_TABLES_FILE = '.pending-custom-tables.bin';
 const STATE_MARKER        = '==RECOVERY-STATE==';
 
 // ─── Bootstrap paths ─────────────────────────────────────────────────────
-$moduleDir = __DIR__;
-$siteDir   = realpath($moduleDir . '/../../');           // …/site/
-$pwRoot    = $siteDir ? realpath($siteDir . '/../') : ''; // …/<pw-root>/
+// repair.php may be installed in two places:
+//   a) site/modules/ProcessWireReset/repair.php — the default
+//   b) directly next to index.php in the PW root — fallback for hosters
+//      that block .php under site/modules/ at the webserver level
+// Find the PW root by walking up from __DIR__ until we see both
+// site/config.php and wire/core/install.sql.
+$pwRoot = null;
+$probe  = realpath(__DIR__) ?: __DIR__;
+for($i = 0; $i < 5; $i++) {
+	if($probe && is_file($probe . '/site/config.php')
+	          && is_file($probe . '/wire/core/install.sql')) {
+		$pwRoot = $probe;
+		break;
+	}
+	$parent = dirname($probe);
+	if($parent === $probe) break;
+	$probe = $parent;
+}
+if(!$pwRoot) {
+	http_response_code(500);
+	header('Content-Type: text/plain; charset=utf-8');
+	echo "repair.php: could not locate ProcessWire root.\n"
+		. "Place this file either in site/modules/ProcessWireReset/ or in the PW root next to index.php.";
+	exit;
+}
+
+$siteDir   = $pwRoot . '/site';
+$wireDir   = $pwRoot . '/wire';
 $configPhp = $siteDir . '/config.php';
-$wireDir   = $pwRoot ? $pwRoot . '/wire' : '';
+$moduleDir = $siteDir . '/modules/ProcessWireReset';
 
 // ─── Render helpers ──────────────────────────────────────────────────────
 function repair_response($status, $title, $body, $loginUrl = '') {
