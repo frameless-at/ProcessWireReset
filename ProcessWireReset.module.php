@@ -103,10 +103,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	public function announceSnapshot() {
 		$page = $this->wire('page');
-		if(!$page || $page->process !== 'ProcessHome') return;
+		// if(!$page || $page->process !== 'ProcessHome') return;
 		$user = $this->wire('user');
-		if(!$user || !$user->isSuperuser()) return;
-		if(!file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) return;
+		// if(!$user || !$user->isSuperuser()) return;
+		// if(!file_exists(__DIR__ . '/' . self::SNAPSHOT_FILE)) return;
 
 		$editUrl = $this->wire('config')->urls->admin . 'module/edit?name=' . $this->className();
 		$msg = sprintf(
