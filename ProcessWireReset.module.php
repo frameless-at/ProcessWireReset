@@ -468,6 +468,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		if($action === 'delete') {
 			$this->deleteCustomTablesSnapshot();
 			$this->message($this->_('Snapshot deleted.'));
+			$userRef = ($this->wire('user') && $this->wire('user')->name)
+				? $this->wire('user')->name
+				: '?';
+			$this->wire('log')->save('processwirereset', "Snapshot discarded by user $userRef");
 			return;
 		}
 
@@ -497,6 +501,19 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 						$this->_n('Restored %d table: %s', 'Restored %d tables: %s', count($restored)),
 						count($restored), implode(', ', $restored)
 					));
+					// Audit trail — one log line per table with row count
+					// and the user who triggered the restore.
+					$log     = $this->wire('log');
+					$userRef = ($this->wire('user') && $this->wire('user')->name)
+						? $this->wire('user')->name
+						: '?';
+					foreach($restored as $tableName) {
+						$rows = isset($subset[$tableName]['rows']) ? count($subset[$tableName]['rows']) : 0;
+						$log->save('processwirereset', sprintf(
+							'Snapshot restore: table `%s` (%d rows) by user %s',
+							$tableName, $rows, $userRef
+						));
+					}
 					// Drop restored tables from the snapshot. Mark the
 					// snapshot as acknowledged so the admin banner stops
 					// reappearing — even if the user deliberately left some
@@ -514,6 +531,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 				}
 			} catch(\Exception $e) {
 				$this->error($this->_('Restore failed: ') . $e->getMessage());
+				$this->wire('log')->error('Snapshot restore failed: ' . $e->getMessage());
 			}
 		}
 	}
