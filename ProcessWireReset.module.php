@@ -250,6 +250,13 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// Restore custom tables after all module installs
 		$this->processPendingCustomTables($database);
 
+		// Reset is fully complete (install loop ran end-to-end, custom
+		// tables restored). Drop the recovery state — only here, never
+		// in early-return paths or in processPendingCustomTables itself,
+		// so that a crashed install (e.g. die() inside a kept module's
+		// install()) leaves recovery.state.php on disk for repair.php.
+		$this->cleanupRecoveryState();
+
 		$this->wire('user', $savedUser);
 
 		// Redirect back to admin once more so PW's SystemUpdater gets a clean
@@ -306,10 +313,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	protected function processPendingCustomTables($database) {
 		$file = __DIR__ . '/' . self::PENDING_TABLES_FILE;
-		if(!file_exists($file)) {
-			$this->cleanupRecoveryState();
-			return;
-		}
+		if(!file_exists($file)) return;
 
 		$raw = file_get_contents($file);
 		if(!unlink($file)) {
@@ -328,9 +332,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		} catch(\Exception $e) {
 			$this->wire('log')->error('ProcessWireReset: table restore failed: ' . $e->getMessage());
 		}
-
-		// Last step of the deferred-task chain — token can expire now.
-		$this->cleanupRecoveryState();
 	}
 
 	// =========================================================================
