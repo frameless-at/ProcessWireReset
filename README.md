@@ -10,8 +10,6 @@ afterwards.
 > for use during development, testing, and CI workflows. **Do not install on a
 > production site without understanding what it does.**
 
----
-
 ## Typical use cases
 
 - **Iterative module / template / profile development.** Wipe pages,
@@ -35,8 +33,6 @@ more accurately than reinstalling PW from scratch. It is **not**
 suitable for fully unattended scenarios (cron-triggered demo
 resets, CI pipelines) — the flow requires a confirmation modal and
 the user copying the recovery URL before the destructive phase.
-
----
 
 ## What it does
 
