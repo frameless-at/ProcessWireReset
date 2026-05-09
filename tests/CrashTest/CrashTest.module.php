@@ -38,6 +38,14 @@
  * so the install succeeds and re-arms.
  *
  * Cleanup: uninstall via Modules screen, or remove the directory.
+ *
+ * Permissions:
+ *   `site/modules/CrashTest/` must be writable by the webserver user
+ *   (e.g. www-data, apache, nginx). install() needs to create
+ *   `.crash-on-reinstall` here. If you uploaded via FTP/SSH as a
+ *   different user, run `chmod 775 site/modules/CrashTest` (or
+ *   transfer ownership) — otherwise the first install() throws a
+ *   WireException naming the exact problem.
  */
 class CrashTest extends WireData implements Module {
 
@@ -65,7 +73,17 @@ class CrashTest extends WireData implements Module {
 			die("CrashTest: armed re-install fatal triggered for repair.php testing.\n");
 		}
 		// First install on this filesystem copy — arm for the next call.
-		@file_put_contents($marker, "Armed by CrashTest::install(); will trigger on next install().\n");
+		// Surface write failures explicitly: a silent @file_put_contents()
+		// would let install() succeed without arming, which then leaves S17
+		// looking like "the test does nothing on reset".
+		$bytes = @file_put_contents($marker, "Armed by CrashTest::install(); will trigger on next install().\n");
+		if($bytes === false) {
+			throw new WireException(
+				'CrashTest: cannot write arm marker to ' . $marker . '. '
+				. 'The module directory must be writable by the webserver user. '
+				. 'Try `chmod 775 site/modules/CrashTest` or transferring ownership.'
+			);
+		}
 	}
 
 	public function uninstall() {
