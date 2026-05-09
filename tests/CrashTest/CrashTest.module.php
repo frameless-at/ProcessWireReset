@@ -9,12 +9,16 @@
  * module directory. The marker arms the trigger: on the NEXT
  * install() — i.e. the deferred re-install run by
  * processPendingInstalls() at the end of a reset — install() consumes
- * the marker and throws.
+ * the marker and HARD-KILLS the request via die().
  *
- * That throw aborts the deferred-install loop, cleanupRecoveryState()
- * is never reached, recovery.state.php stays on disk, and the
- * recovery URL captured from the confirmation modal can be used to
- * invoke repair.php.
+ * die() is deliberate. A regular Exception would be caught by
+ * processPendingInstalls()' catch(\Exception) block, the row would
+ * be rolled back, the reset would finish "normally", and
+ * cleanupRecoveryState() would delete recovery.state.php — defeating
+ * the whole point of the test. Killing the request mid-way is
+ * exactly what a real fatal-error inside an install() looks like,
+ * and it's the case repair.php exists for: recovery.state.php is
+ * preserved because no cleanup code runs.
  *
  * Marker is consumed on the failing call so a fresh UI install after
  * recovery succeeds again (and re-arms automatically).
@@ -55,9 +59,10 @@ class CrashTest extends WireData implements Module {
 			// Consume the marker so a manual re-install via the modules
 			// screen after a successful recovery works without leftover state.
 			@unlink($marker);
-			throw new WireException(
-				'CrashTest: armed re-install crash for repair.php testing.'
-			);
+			// Hard-kill the request. A throw would be caught by
+			// processPendingInstalls(); we want the response to die
+			// mid-stream so recovery.state.php is preserved for repair.php.
+			die("CrashTest: armed re-install fatal triggered for repair.php testing.\n");
 		}
 		// First install on this filesystem copy — arm for the next call.
 		@file_put_contents($marker, "Armed by CrashTest::install(); will trigger on next install().\n");

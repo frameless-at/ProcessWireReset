@@ -480,14 +480,24 @@ superuser credentials.
      manager, second tab — anywhere it survives a PW outage)
    - Tick **I saved the recovery URL**
 3. Click **Execute Reset**
-4. After redirect, observe that the admin login is broken / the next
-   request fails — `processPendingInstalls()` re-runs `CrashTest::install()`,
-   which throws because the arm marker survived in the kept module dir
+4. After redirect, observe that the response dies mid-stream —
+   `processPendingInstalls()` re-runs `CrashTest::install()`, which
+   finds the marker and `die()`s. This is intentional: a regular
+   `throw` would be caught by the install-loop's `catch(\Exception)`
+   block, the row would be rolled back, and the reset would finish
+   "successfully" — defeating the test. The hard kill is what a real
+   fatal-error inside an `install()` would look like.
 
 **Expected (failure phase):**
+- The browser shows a partial / broken admin page or the
+  `die()` message, depending on whether output buffering was active
 - `recovery.state.php` exists in `site/modules/ProcessWireReset/`
-- `.pending-installs.json` also still exists (cleanup not reached)
+- `.pending-installs.json` was already deleted at the top of
+  `processPendingInstalls()` — that's expected, do not panic
 - Direct HTTP access to `recovery.state.php` returns 403 (`<?php exit;` wrapper)
+- The kept-modules row for CrashTest is still in the `modules` table
+  (rollback never ran) — repair.php will wipe it during the recovery
+  install
 
 **Action — recovery:**
 5. Open the saved recovery URL in a browser
