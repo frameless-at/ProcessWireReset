@@ -29,8 +29,8 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	/** Pending module-installs file (written by executeReset, read on next boot) */
 	const PENDING_FILE = '.pending-installs.json';
 
-	/** Pending custom-table-restore file */
-	const PENDING_TABLES_FILE = '.pending-custom-tables.bin';
+	/** Persistent snapshot of non-canonical tables, kept across resets for opt-in restore */
+	const SNAPSHOT_FILE = '.snapshot.bin';
 
 	/** Recovery state file consumed by repair.php when a reset crashes */
 	const RECOVERY_STATE_FILE = 'recovery.state.php';
@@ -60,9 +60,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			'icon'     => 'refresh',
 			'singular' => true,
 			// Only autoload when there are deferred tasks from a previous reset.
+			// Snapshot files are NOT a trigger — they are consumed on demand
+			// from the module config screen.
 			'autoload' => function() {
-				return file_exists(__DIR__ . '/' . self::PENDING_FILE)
-				    || file_exists(__DIR__ . '/' . self::PENDING_TABLES_FILE);
+				return file_exists(__DIR__ . '/' . self::PENDING_FILE);
 			},
 			'requires' => ['ProcessWire>=3.0.0'],
 		];
@@ -86,8 +87,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * Schedules processPendingInstalls() to run after PW is fully ready.
 	 */
 	public function init() {
-		if(!file_exists(__DIR__ . '/' . self::PENDING_FILE)
-		&& !file_exists(__DIR__ . '/' . self::PENDING_TABLES_FILE)) return;
+		if(!file_exists(__DIR__ . '/' . self::PENDING_FILE)) return;
 		$this->addHookAfter('ProcessWire::ready', $this, 'processPendingInstalls');
 	}
 
@@ -173,7 +173,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		if(file_exists($workFile)) @unlink($workFile); // stale from a previous crash
 
 		if(!file_exists($pendingFile)) {
-			$this->processPendingCustomTables($this->wire('database'));
 			while(ob_get_level() > 0) ob_end_clean();
 			return;
 		}
@@ -189,7 +188,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		@unlink($workFile);
 
 		if(!is_array($pending) || empty($pending)) {
-			$this->processPendingCustomTables($this->wire('database'));
 			while(ob_get_level() > 0) ob_end_clean();
 			return;
 		}
@@ -304,14 +302,10 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 			$log->save('processwirereset', "Install failed for $className: " . ($failed[$className] ?? 'unknown'));
 		}
 
-		// Restore custom tables after all module installs
-		$this->processPendingCustomTables($database);
-
-		// Reset is fully complete (install loop ran end-to-end, custom
-		// tables restored). Drop the recovery state — only here, never
-		// in early-return paths or in processPendingCustomTables itself,
-		// so that a crashed install (e.g. die() inside a kept module's
-		// install()) leaves recovery.state.php on disk for repair.php.
+		// Reset is fully complete (install loop ran end-to-end). Drop the
+		// recovery state — only here, never in early-return paths — so that
+		// a crashed install (e.g. die() inside a kept module's install())
+		// leaves recovery.state.php on disk for repair.php to consume.
 		$this->cleanupRecoveryState();
 
 		$this->wire('user', $savedUser);
@@ -361,46 +355,6 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		exit;
 	}
 
-	/**
-	 * Read the pending custom-tables file and restore backed-up table data.
-	 * Runs at the end of processPendingInstalls() — after all install() calls
-	 * have created their (empty) fresh tables, we overwrite them with real data.
-	 *
-	 * @param WireDatabasePDO $database
-	 */
-	protected function processPendingCustomTables($database) {
-		$file     = __DIR__ . '/' . self::PENDING_TABLES_FILE;
-		$workFile = $file . '.processing';
-
-		// Atomic claim — same rationale as in processPendingInstalls():
-		// rename out of the autoload trigger path so concurrent requests
-		// don't double-process and a mid-crash doesn't leave a request-loop trap.
-		if(file_exists($workFile)) @unlink($workFile); // stale from a previous crash
-
-		if(!file_exists($file)) return;
-
-		if(!@rename($file, $workFile)) {
-			$this->wire('log')->error("ProcessWireReset: cannot rename $file to $workFile");
-			return;
-		}
-
-		$raw = @file_get_contents($workFile);
-		@unlink($workFile);
-		if($raw === false || $raw === '') return;
-
-		$tables = @unserialize($raw, ['allowed_classes' => false]);
-		if(!is_array($tables) || empty($tables)) return;
-
-		try {
-			$restored = $this->restoreCustomTables($database, $tables);
-			if(!empty($restored)) {
-				$this->wire('log')->save('processwirereset', 'Restored tables: ' . implode(', ', $restored));
-			}
-		} catch(\Exception $e) {
-			$this->wire('log')->error('ProcessWireReset: table restore failed: ' . $e->getMessage());
-		}
-	}
-
 	// =========================================================================
 	// Module Config GUI
 	// =========================================================================
@@ -413,6 +367,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * @return InputfieldWrapper
 	 */
 	public function getModuleConfigInputfields(array $data) {
+		$this->handleSnapshotPostRequest();
 		$this->handleResetPostRequest($data);
 		return $this->buildConfigInputfields($data);
 	}
@@ -429,6 +384,55 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		if($input->post('submit_reset') === null) return;
 		if($input->post('confirmReset') !== self::CONFIRM_TEXT) return;
 		$this->executeReset($data);
+	}
+
+	/**
+	 * Handle snapshot restore / delete actions submitted from the
+	 * module config screen.
+	 */
+	private function handleSnapshotPostRequest() {
+		$input = $this->wire('input');
+		if(!$input->requestMethod('POST')) return;
+		$action = (string) $input->post('_pwreset_snapshot_action');
+		if($action === '') return;
+
+		if($action === 'delete') {
+			$this->deleteCustomTablesSnapshot();
+			$this->message($this->_('Snapshot deleted.'));
+			return;
+		}
+
+		if($action === 'restore') {
+			$selected = (array) $input->post('_pwreset_snapshot_tables');
+			$selected = array_filter(array_map(function($s) {
+				return preg_replace('/[^a-zA-Z0-9_]/', '', (string) $s);
+			}, $selected));
+			if(empty($selected)) {
+				$this->error($this->_('No tables selected for restore.'));
+				return;
+			}
+			$payload = $this->readCustomTablesSnapshot();
+			if(!$payload) {
+				$this->error($this->_('No snapshot available to restore from.'));
+				return;
+			}
+			$subset = array_intersect_key($payload['tables'], array_flip($selected));
+			if(empty($subset)) {
+				$this->error($this->_('Selected tables are not in the snapshot.'));
+				return;
+			}
+			try {
+				$restored = $this->restoreCustomTables($this->wire('database'), $subset);
+				if(!empty($restored)) {
+					$this->message(sprintf(
+						$this->_n('Restored %d table: %s', 'Restored %d tables: %s', count($restored)),
+						count($restored), implode(', ', $restored)
+					));
+				}
+			} catch(\Exception $e) {
+				$this->error($this->_('Restore failed: ') . $e->getMessage());
+			}
+		}
 	}
 
 	/**
@@ -557,7 +561,80 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		$f->value = $this->buildResetModalMarkup($data);
 		$inputfields->add($f);
 
+		// ── Snapshot restore ──────────────────────────────────────────────────
+		$snapshot = $this->readCustomTablesSnapshot();
+		if($snapshot) {
+			/** @var InputfieldMarkup $f */
+			$f = $modules->get('InputfieldMarkup');
+			$f->attr('name', '_pwreset_snapshot');
+			$f->label = $this->_('Database snapshot');
+			$f->icon  = 'database';
+			$f->collapsed = Inputfield::collapsedNo;
+			$f->value = $this->buildSnapshotMarkup($snapshot);
+			$inputfields->add($f);
+		}
+
 		return $inputfields;
+	}
+
+	/**
+	 * Render the snapshot section: table list with checkboxes, ownership
+	 * heuristic per row, restore + delete buttons. The whole block is
+	 * inside the surrounding PW config form, so the buttons just set a
+	 * hidden action field and resubmit.
+	 */
+	private function buildSnapshotMarkup(array $snapshot) {
+		$keepModules = (array) ($snapshot['keep_modules'] ?? []);
+		$tables      = (array) ($snapshot['tables']       ?? []);
+		$created     = (int)   ($snapshot['created_at']   ?? 0);
+
+		$h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
+
+		$dateLabel    = $created > 0 ? date('Y-m-d H:i', $created) : '?';
+		$introText    = sprintf($this->_('Snapshot taken %s. Select tables to restore.'), $h($dateLabel));
+		$tableHdr     = $this->_('Table');
+		$ownerHdr     = $this->_('Likely owner (heuristic)');
+		$rowsHdr      = $this->_('Rows');
+		$restoreLabel = $this->_('Restore selected tables');
+		$deleteLabel  = $this->_('Delete snapshot');
+		$confirmDel   = $this->_('Delete the snapshot? This cannot be undone.');
+		$disclaimer   = $this->_('Owner suggestions are heuristic — verify before restoring. Restoring a table whose module is not present can leave orphaned data.');
+
+		$rows = '';
+		ksort($tables);
+		foreach($tables as $name => $tableData) {
+			$rowCount = isset($tableData['rows']) ? count($tableData['rows']) : 0;
+			$owner    = $this->guessTableOwner($name, $keepModules);
+			$rows .= '<tr>'
+				. '<td><label><input type="checkbox" name="_pwreset_snapshot_tables[]" value="' . $h($name) . '"> <code>' . $h($name) . '</code></label></td>'
+				. '<td>' . $h($owner) . '</td>'
+				. '<td style="text-align:right">' . (int) $rowCount . '</td>'
+				. '</tr>';
+		}
+
+		$confirmDelJs = $h(json_encode($confirmDel));
+
+		return <<<HTMLSNAPSHOT
+<div class="pwreset-snapshot">
+	<p>{$introText}</p>
+	<table class="uk-table uk-table-divider uk-table-small">
+		<thead><tr><th>{$tableHdr}</th><th>{$ownerHdr}</th><th style="text-align:right">{$rowsHdr}</th></tr></thead>
+		<tbody>{$rows}</tbody>
+	</table>
+	<p><small>{$disclaimer}</small></p>
+	<div class="uk-margin-top">
+		<button type="submit" class="uk-button uk-button-primary"
+			onclick="document.getElementById('pwreset-snapshot-action').value='restore';">
+			{$restoreLabel}
+		</button>
+		<button type="submit" class="uk-button uk-button-danger"
+			onclick="if(!confirm({$confirmDelJs})){return false;}document.getElementById('pwreset-snapshot-action').value='delete';">
+			{$deleteLabel}
+		</button>
+	</div>
+	<input type="hidden" id="pwreset-snapshot-action" name="_pwreset_snapshot_action" value="">
+</div>
+HTMLSNAPSHOT;
 	}
 
 	/**
@@ -1015,7 +1092,7 @@ HTMLMODAL;
 			$this->restoreSelfModule($database, $keptModuleData);
 
 			// 2j. Write deferred-task files for the next request
-			$this->writePendingCustomTables($customTables);
+			$this->writeCustomTablesSnapshot($customTables, $keepModules);
 			$this->writePendingInstalls($keptModuleData, $installOrder);
 
 			// 2k. Clear stale session throttle entries so the first post-reset
@@ -1030,11 +1107,9 @@ HTMLMODAL;
 			// Clean up half-written pending files (and any stale .processing
 			// siblings from a previous crash) so the next request doesn't
 			// try to install modules into an inconsistent DB state.
-			foreach([self::PENDING_FILE, self::PENDING_TABLES_FILE] as $f) {
-				$p = __DIR__ . '/' . $f;
-				if(file_exists($p))               @unlink($p);
-				if(file_exists($p . '.processing')) @unlink($p . '.processing');
-			}
+			$p = __DIR__ . '/' . self::PENDING_FILE;
+			if(file_exists($p))                 @unlink($p);
+			if(file_exists($p . '.processing')) @unlink($p . '.processing');
 			$this->wire('log')->error('ProcessWireReset DB phase failed: ' . $e->getMessage());
 			throw new WireException('Database reset failed: ' . $e->getMessage() .
 				' — installation may be inconsistent.', 0, $e);
@@ -1407,20 +1482,115 @@ HTMLMODAL;
 	}
 
 	/**
-	 * Serialize and write the backed-up custom tables to a pending file.
-	 * Processed in processPendingCustomTables() on the next request.
+	 * Write a persistent snapshot of the captured custom tables.
 	 *
-	 * @throws WireException if the file cannot be written
+	 * The snapshot is the only way to recover module-specific tables after
+	 * a reset — no automatic restore happens. The user opts into restoring
+	 * individual tables from the module config screen post-login.
+	 *
+	 * Format: PHP wrapper that 403s on direct HTTP access, plus a
+	 * base64-encoded serialized payload between markers.
+	 *
+	 * Only the latest snapshot is kept; the previous one is overwritten
+	 * verbatim. Empty backups remove an existing snapshot file.
 	 */
-	protected function writePendingCustomTables(array $customTables) {
-		$file = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+	protected function writeCustomTablesSnapshot(array $customTables, array $keepModules) {
+		$file = __DIR__ . '/' . self::SNAPSHOT_FILE;
+
 		if(empty($customTables)) {
 			if(file_exists($file)) @unlink($file);
 			return;
 		}
-		if(file_put_contents($file, serialize($customTables)) === false) {
-			throw new WireException("Cannot write pending-tables file: $file");
+
+		$payload = [
+			'version'      => 1,
+			'created_at'   => time(),
+			'keep_modules' => array_values($keepModules),
+			'tables'       => $customTables,
+		];
+		$encoded = base64_encode(serialize($payload));
+		$body    = "<?php http_response_code(403); exit; ?>\n"
+			. "==SNAPSHOT BEGIN==\n"
+			. $encoded . "\n"
+			. "==SNAPSHOT END==\n";
+
+		if(file_put_contents($file, $body, LOCK_EX) === false) {
+			throw new WireException("Cannot write custom-tables snapshot: $file");
 		}
+		@chmod($file, 0600);
+	}
+
+	/**
+	 * Read the persistent snapshot file. Returns null if no snapshot,
+	 * or the unserialized payload array on success.
+	 */
+	protected function readCustomTablesSnapshot() {
+		$file = __DIR__ . '/' . self::SNAPSHOT_FILE;
+		if(!is_file($file)) return null;
+		$raw = (string) @file_get_contents($file);
+		if($raw === '') return null;
+		$parts = explode('==SNAPSHOT BEGIN==', $raw);
+		if(count($parts) < 2) return null;
+		$body = $parts[1];
+		$end  = strpos($body, '==SNAPSHOT END==');
+		if($end === false) return null;
+		$payload = @unserialize((string) base64_decode(trim(substr($body, 0, $end)), true), ['allowed_classes' => false]);
+		return is_array($payload) && !empty($payload['tables']) ? $payload : null;
+	}
+
+	/**
+	 * Delete the persistent snapshot file.
+	 */
+	protected function deleteCustomTablesSnapshot() {
+		$file = __DIR__ . '/' . self::SNAPSHOT_FILE;
+		if(file_exists($file)) @unlink($file);
+	}
+
+	/**
+	 * Best-effort guess at which kept module a snapshot table belongs to.
+	 *
+	 * Three sources, in descending reliability:
+	 *   1. `field_<name>` tables → look up the field's fieldtype in the
+	 *      live `fields` table. This is deterministic PW semantics.
+	 *   2. Class-name prefix match against the keep-module list captured
+	 *      in the snapshot (e.g. ProcessChangelog → process_changelog).
+	 *   3. Otherwise: marked unknown.
+	 *
+	 * Returns a short human-readable string for display only — never used
+	 * for automatic restore decisions.
+	 */
+	protected function guessTableOwner($tableName, array $keepModules) {
+		// 1. Field tables — authoritative lookup.
+		if(strpos($tableName, 'field_') === 0) {
+			$fieldName = substr($tableName, 6);
+			try {
+				$stmt = $this->wire('database')->prepare("SELECT type FROM fields WHERE name = :n");
+				$stmt->execute([':n' => $fieldName]);
+				$type = $stmt->fetchColumn();
+				if($type) {
+					return sprintf($this->_('Field "%s" (Fieldtype: %s)'), $fieldName, $type);
+				}
+				return sprintf($this->_('Field "%s" (no longer registered)'), $fieldName);
+			} catch(\PDOException $e) {
+				return sprintf($this->_('Field "%s"'), $fieldName);
+			}
+		}
+
+		// 2. Class-name prefix heuristic against keep modules.
+		$lcTable = strtolower($tableName);
+		foreach($keepModules as $modClass) {
+			$candidates = [
+				strtolower($modClass),
+				strtolower(preg_replace('/(?<!^)([A-Z])/', '_$1', $modClass)),
+			];
+			foreach($candidates as $cand) {
+				if($cand !== '' && strpos($lcTable, $cand) === 0) {
+					return sprintf($this->_('Likely module: %s'), $modClass);
+				}
+			}
+		}
+
+		return $this->_('Unknown owner');
 	}
 
 	// =========================================================================
@@ -1936,16 +2106,14 @@ HTMLMODAL;
 	}
 
 	/**
-	 * Delete the recovery state file once a reset (incl. deferred installs)
-	 * has finished without leaving any pending tasks behind. Called from
-	 * processPendingInstalls() and processPendingCustomTables() at their
-	 * respective tail ends.
+	 * Delete the recovery state file once the deferred-install loop has
+	 * finished without leaving a pending file behind. Called from
+	 * processPendingInstalls() at the tail end.
 	 */
 	protected function cleanupRecoveryState() {
 		$pending  = __DIR__ . '/' . self::PENDING_FILE;
-		$tables   = __DIR__ . '/' . self::PENDING_TABLES_FILE;
 		$recovery = __DIR__ . '/' . self::RECOVERY_STATE_FILE;
-		if(file_exists($pending) || file_exists($tables)) return;
+		if(file_exists($pending)) return;
 		if(file_exists($recovery)) @unlink($recovery);
 	}
 }
