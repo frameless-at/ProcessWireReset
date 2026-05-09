@@ -149,6 +149,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 */
 	public function processPendingInstalls() {
 		$pendingFile = __DIR__ . '/' . self::PENDING_FILE;
+		$workFile    = $pendingFile . '.processing';
 
 		// Capture any output produced by PW core or by module install()
 		// hooks during the deferred-install phase. PW 3.0.218+ for instance
@@ -157,19 +158,35 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 		// modules-flags cache — harmless to the install but fatal to the
 		// header()-based redirect at the end of this method.
 		ob_start();
+
+		// Atomically claim the pending file by renaming it out of the
+		// autoload trigger path. Three benefits:
+		//   1. Concurrent requests (favicon, AJAX) that woke up on the
+		//      same pending file see no file after the rename and do not
+		//      double-process.
+		//   2. unlink() failure no longer leaves a request-loop trap —
+		//      a failed rename aborts cleanly.
+		//   3. A crash during processing leaves a .processing file behind,
+		//      but the original path is gone, so the next request does NOT
+		//      re-trigger the same crash. The stale .processing is cleaned
+		//      up at the top of the next run.
+		if(file_exists($workFile)) @unlink($workFile); // stale from a previous crash
+
 		if(!file_exists($pendingFile)) {
 			$this->processPendingCustomTables($this->wire('database'));
 			while(ob_get_level() > 0) ob_end_clean();
 			return;
 		}
 
-		$raw     = file_get_contents($pendingFile);
-		$pending = ($raw !== false) ? json_decode($raw, true) : null;
-
-		// Delete before processing — worst case is one extra attempt, not a loop
-		if(!unlink($pendingFile)) {
-			$this->wire('log')->error("ProcessWireReset: cannot remove $pendingFile");
+		if(!@rename($pendingFile, $workFile)) {
+			$this->wire('log')->error("ProcessWireReset: cannot rename $pendingFile to $workFile");
+			while(ob_get_level() > 0) ob_end_clean();
+			return;
 		}
+
+		$raw     = @file_get_contents($workFile);
+		$pending = ($raw !== false) ? json_decode($raw, true) : null;
+		@unlink($workFile);
 
 		if(!is_array($pending) || empty($pending)) {
 			$this->processPendingCustomTables($this->wire('database'));
@@ -352,13 +369,23 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	 * @param WireDatabasePDO $database
 	 */
 	protected function processPendingCustomTables($database) {
-		$file = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+		$file     = __DIR__ . '/' . self::PENDING_TABLES_FILE;
+		$workFile = $file . '.processing';
+
+		// Atomic claim — same rationale as in processPendingInstalls():
+		// rename out of the autoload trigger path so concurrent requests
+		// don't double-process and a mid-crash doesn't leave a request-loop trap.
+		if(file_exists($workFile)) @unlink($workFile); // stale from a previous crash
+
 		if(!file_exists($file)) return;
 
-		$raw = file_get_contents($file);
-		if(!unlink($file)) {
-			$this->wire('log')->error("ProcessWireReset: cannot remove $file");
+		if(!@rename($file, $workFile)) {
+			$this->wire('log')->error("ProcessWireReset: cannot rename $file to $workFile");
+			return;
 		}
+
+		$raw = @file_get_contents($workFile);
+		@unlink($workFile);
 		if($raw === false || $raw === '') return;
 
 		$tables = @unserialize($raw, ['allowed_classes' => false]);
@@ -1034,11 +1061,13 @@ HTMLMODAL;
 			}
 
 		} catch(\Exception $e) {
-			// Clean up half-written pending files so the next request doesn't
+			// Clean up half-written pending files (and any stale .processing
+			// siblings from a previous crash) so the next request doesn't
 			// try to install modules into an inconsistent DB state.
 			foreach([self::PENDING_FILE, self::PENDING_TABLES_FILE] as $f) {
 				$p = __DIR__ . '/' . $f;
-				if(file_exists($p)) @unlink($p);
+				if(file_exists($p))               @unlink($p);
+				if(file_exists($p . '.processing')) @unlink($p . '.processing');
 			}
 			$this->wire('log')->error('ProcessWireReset DB phase failed: ' . $e->getMessage());
 			throw new WireException('Database reset failed: ' . $e->getMessage() .
