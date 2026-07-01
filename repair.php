@@ -14,8 +14,10 @@
  * Runs WITHOUT a working ProcessWire bootstrap — uses raw PDO and a
  * stubbed config object. Only requires that
  *   - `site/config.php` is intact (DB credentials)
- *   - `wire/core/WireDatabaseBackup.php` is intact (SQL importer)
- *   - `wire/core/install.sql` and the bundled profile install.sql exist
+ *   - `wire/core/WireDatabaseBackup.php` is intact (SQL importer; dev builds
+ *     keep it under wire/core/WireDatabase/)
+ *   - the bundled core + profile install.sql exist (dev ships no
+ *     wire/core/install.sql, so the module carries its own copy)
  */
 
 // Recovery is a destructive last-resort tool — surface every error.
@@ -62,12 +64,14 @@ const STATE_MARKER        = '==RECOVERY-STATE==';
 //   b) directly next to index.php in the PW root — fallback for hosters
 //      that block .php under site/modules/ at the webserver level
 // Find the PW root by walking up from __DIR__ until we see both
-// site/config.php and wire/core/install.sql.
+// site/config.php and the core bootstrap. We probe wire/core/ProcessWire.php
+// (present in every layout) rather than wire/core/install.sql, which dev
+// builds do not ship.
 $pwRoot = null;
 $probe  = realpath(__DIR__) ?: __DIR__;
 for($i = 0; $i < 5; $i++) {
 	if($probe && is_file($probe . '/site/config.php')
-	          && is_file($probe . '/wire/core/install.sql')) {
+	          && is_file($probe . '/wire/core/ProcessWire.php')) {
 		$pwRoot = $probe;
 		break;
 	}
