@@ -32,6 +32,11 @@ class InstallerCore extends Installer {
 	public $numErrors  = 0;
 	public $inSection  = false;
 
+	// Not declared by the parent Installer; declared here so executeReset() can
+	// set them without triggering PHP 8.2 "dynamic property" deprecations.
+	public $dbEngine   = 'InnoDB';
+	public $dbCharset  = 'utf8mb4';
+
 	/** @var string[] Messages collected during import (replaces HTML output) */
 	public $messages = [];
 
@@ -136,8 +141,19 @@ class InstallerCore extends Installer {
 		}
 		if(count($replace)) $restoreOptions['findReplaceCreateTable'] = $replace;
 
+		// Load WireDatabaseBackup. Stable ProcessWire keeps it at
+		// wire/core/WireDatabaseBackup.php; the dev branch moved it to
+		// wire/core/WireDatabase/WireDatabaseBackup.php. Prefer PW's autoloader,
+		// then fall back to a manual require across both known locations.
+		if(!class_exists('\\ProcessWire\\WireDatabaseBackup')) {
+			$coreDir = wire('config')->paths->wire . 'core/';
+			foreach(['WireDatabaseBackup.php', 'WireDatabase/WireDatabaseBackup.php'] as $rel) {
+				if(is_file($coreDir . $rel)) { require_once $coreDir . $rel; break; }
+			}
+		}
 		if(!class_exists('\\ProcessWire\\WireDatabaseBackup', false)) {
-			require_once wire('config')->paths->wire . 'core/WireDatabaseBackup.php';
+			$this->alertErr('WireDatabaseBackup class not found in ProcessWire core.');
+			return;
 		}
 		$backup = new WireDatabaseBackup();
 		$backup->setDatabase($database);

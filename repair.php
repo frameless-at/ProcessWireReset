@@ -432,8 +432,13 @@ try {
 repair_step('All tables dropped');
 
 // ─── 4. Import core + profile install.sql via WireDatabaseBackup ─────────
-$wdbFile = $wireDir . '/core/WireDatabaseBackup.php';
-if(!is_file($wdbFile)) repair_fail('wire/core/WireDatabaseBackup.php not found.', 500);
+// Stable ProcessWire keeps WireDatabaseBackup at wire/core/WireDatabaseBackup.php;
+// the dev branch moved it to wire/core/WireDatabase/WireDatabaseBackup.php.
+$wdbFile = '';
+foreach(['/core/WireDatabaseBackup.php', '/core/WireDatabase/WireDatabaseBackup.php'] as $rel) {
+	if(is_file($wireDir . $rel)) { $wdbFile = $wireDir . $rel; break; }
+}
+if($wdbFile === '') repair_fail('WireDatabaseBackup.php not found in wire/core.', 500);
 
 if(!class_exists('\\ProcessWire\\WireDatabaseBackup', false)) {
 	require_once $wdbFile;

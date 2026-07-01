@@ -54,7 +54,7 @@ class ProcessWireReset extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title'    => 'ProcessWire Reset',
-			'version'  => '1.0.0',
+			'version'  => '1.0.1',
 			'summary'  => 'Resets a ProcessWire installation to a clean profile state while preserving the superuser and selected modules.',
 			'author'   => 'frameless',
 			'icon'     => 'refresh',
@@ -919,10 +919,16 @@ HTMLMODAL;
 		$superuser = $this->backupSuperuser($database, $config);
 		if(!$superuser) throw new WireException('Could not backup superuser — reset aborted.');
 
-		$coreSQL    = $config->paths->wire . 'core/install.sql';
+		$coreSQL    = $this->resolveCoreInstallSql();
 		$profileSQL = $this->resolveProfileInstallSql(['profilePath' => $profilePath]);
 
-		if(!is_file($coreSQL))    throw new WireException("Core install.sql not found: $coreSQL");
+		if(!$coreSQL || !is_file($coreSQL)) {
+			throw new WireException(
+				'Core install.sql not found. ProcessWire dev builds do not ship '
+				. 'wire/core/install.sql, and the bundled fallback '
+				. 'install/core-install.sql is missing from this module.'
+			);
+		}
 		if(!$profileSQL || !is_file($profileSQL)) throw new WireException("Profile install.sql not found.");
 
 		// Persist recovery state BEFORE the wipe begins. repair.php uses this
@@ -1688,6 +1694,25 @@ HTMLMODAL;
 	// =========================================================================
 	// Path resolution helpers
 	// =========================================================================
+
+	/**
+	 * Resolve the path to the core install.sql.
+	 *
+	 * Stable ProcessWire ships wire/core/install.sql. The dev branch dropped
+	 * that file: its core schema now lives only inside install.php (function
+	 * ProcessWireCoreInstallSql()) and is written to a transient
+	 * site/install/core-install.sql that install.php removes when finished.
+	 * On a completed dev site the core schema therefore exists nowhere on
+	 * disk, so we fall back to a version-neutral copy bundled with this module.
+	 *
+	 * @return string|null Absolute path or null if no core schema is available
+	 */
+	protected function resolveCoreInstallSql() {
+		$core = $this->wire('config')->paths->wire . 'core/install.sql';
+		if(is_file($core)) return $core;
+		$bundled = __DIR__ . '/install/core-install.sql';
+		return is_file($bundled) ? $bundled : null;
+	}
 
 	/**
 	 * Resolve the path to the profile's install.sql.
