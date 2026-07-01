@@ -919,16 +919,17 @@ HTMLMODAL;
 		$superuser = $this->backupSuperuser($database, $config);
 		if(!$superuser) throw new WireException('Could not backup superuser — reset aborted.');
 
-		$coreSQL    = $this->resolveCoreInstallSql();
+		// Stable ProcessWire ships wire/core/install.sql (the base schema plus
+		// the core access rows). The dev branch dropped it. The profile
+		// install.sql is a full dump that builds every table, but its
+		// WireDatabaseBackup dump excludes the access-row tables
+		// (field_roles/field_permissions). So the core file is optional: when it
+		// is absent we import the profile alone and inject the version-constant
+		// access rows afterwards. See injectCoreAccessRows().
+		$coreSQL    = $config->paths->wire . 'core/install.sql';
+		if(!is_file($coreSQL)) $coreSQL = '';
 		$profileSQL = $this->resolveProfileInstallSql(['profilePath' => $profilePath]);
 
-		if(!$coreSQL || !is_file($coreSQL)) {
-			throw new WireException(
-				'Core install.sql not found. ProcessWire dev builds do not ship '
-				. 'wire/core/install.sql, and the bundled fallback '
-				. 'install/core-install.sql is missing from this module.'
-			);
-		}
 		if(!$profileSQL || !is_file($profileSQL)) throw new WireException("Profile install.sql not found.");
 
 		// Persist recovery state BEFORE the wipe begins. repair.php uses this
@@ -981,6 +982,15 @@ HTMLMODAL;
 
 			if($installer->numErrors) {
 				throw new WireException('SQL import errors: ' . implode('; ', $installer->errors));
+			}
+
+			// 2a-bis. On dev builds there is no core install.sql, so the
+			// profile-only import above left field_roles / field_permissions
+			// empty (the profile dump excludes them). Inject the standard,
+			// version-constant PW access rows, or guests cannot even run the
+			// login process.
+			if($coreSQL === '') {
+				$this->injectCoreAccessRows($database);
 			}
 
 			// 2b. Restore field_pass / field_email with original column schemas.
@@ -1696,22 +1706,33 @@ HTMLMODAL;
 	// =========================================================================
 
 	/**
-	 * Resolve the path to the core install.sql.
+	 * Inject the core role and permission assignments.
 	 *
-	 * Stable ProcessWire ships wire/core/install.sql. The dev branch dropped
-	 * that file: its core schema now lives only inside install.php (function
-	 * ProcessWireCoreInstallSql()) and is written to a transient
-	 * site/install/core-install.sql that install.php removes when finished.
-	 * On a completed dev site the core schema therefore exists nowhere on
-	 * disk, so we fall back to a version-neutral copy bundled with this module.
+	 * ProcessWire's core install.sql seeds field_roles and field_permissions
+	 * with the foundational access model: the guest/superuser roles on the
+	 * system users, and the permission grants on the superuser role. A profile
+	 * install.sql dump excludes these tables' rows (excludeExportTables), and
+	 * dev builds ship no core install.sql, so after a profile-only import the
+	 * tables are empty and guests cannot even run the login process.
 	 *
-	 * @return string|null Absolute path or null if no core schema is available
+	 * These page/role/permission IDs are ProcessWire system constants and do
+	 * not change between versions. INSERT IGNORE keeps any rows a custom
+	 * profile supplied itself (keyed on the pages_id/sort primary key).
 	 */
-	protected function resolveCoreInstallSql() {
-		$core = $this->wire('config')->paths->wire . 'core/install.sql';
-		if(is_file($core)) return $core;
-		$bundled = __DIR__ . '/install/core-install.sql';
-		return is_file($bundled) ? $bundled : null;
+	protected function injectCoreAccessRows($database) {
+		$roles = [
+			[40, 37, 0], [41, 37, 0], [41, 38, 2],
+		];
+		$perms = [
+			[38, 32, 1], [38, 34, 2], [38, 35, 3], [37, 36, 0], [38, 36, 0],
+			[38, 50, 4], [38, 51, 5], [38, 52, 7], [38, 53, 8], [38, 54, 6],
+		];
+		$sql = "INSERT IGNORE INTO field_roles (pages_id, data, sort) VALUES (:p, :d, :s)";
+		$stmt = $database->prepare($sql);
+		foreach($roles as $r) $stmt->execute([':p' => $r[0], ':d' => $r[1], ':s' => $r[2]]);
+		$sql = "INSERT IGNORE INTO field_permissions (pages_id, data, sort) VALUES (:p, :d, :s)";
+		$stmt = $database->prepare($sql);
+		foreach($perms as $r) $stmt->execute([':p' => $r[0], ':d' => $r[1], ':s' => $r[2]]);
 	}
 
 	/**

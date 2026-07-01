@@ -16,8 +16,9 @@
  *   - `site/config.php` is intact (DB credentials)
  *   - `wire/core/WireDatabaseBackup.php` is intact (SQL importer; dev builds
  *     keep it under wire/core/WireDatabase/)
- *   - the bundled core + profile install.sql exist (dev ships no
- *     wire/core/install.sql, so the module carries its own copy)
+ *   - the bundled profile install.sql exists. wire/core/install.sql is used
+ *     when present (stable); on dev the profile is imported alone and the
+ *     core access rows are injected afterwards.
  */
 
 // Recovery is a destructive last-resort tool — surface every error.
@@ -342,7 +343,11 @@ $superuser  = (array) $payload['superuser'];
 $coreSQL    = (string) ($payload['core_sql']    ?? '');
 $profileSQL = (string) ($payload['profile_sql'] ?? '');
 
-if(!is_file($coreSQL))    repair_fail('Core install.sql missing.', 500);
+// Core SQL is optional: dev builds ship no wire/core/install.sql, so the
+// recorded core_sql is empty. The profile dump builds every table on its own;
+// the missing access rows are injected after import (see step 4). Only fail if
+// a path was recorded but no longer resolves to a file.
+if($coreSQL !== '' && !is_file($coreSQL)) repair_fail('Core install.sql missing.', 500);
 if(!is_file($profileSQL)) repair_fail('Profile install.sql missing.', 500);
 repair_step('Install profiles located');
 
@@ -467,9 +472,28 @@ if(strtolower($dbCharset) === 'utf8mb4') {
 try {
 	$backup = new WireDatabaseBackup();
 	$backup->setDatabase($pdo);
-	if(!$backup->restoreMerge($coreSQL, $profileSQL, ['findReplaceCreateTable' => $replace])) {
+	// Merge core + profile when a core file exists; otherwise the profile dump
+	// builds every table on its own (dev builds have no wire/core/install.sql).
+	$imported = ($coreSQL !== '' && is_file($coreSQL))
+		? $backup->restoreMerge($coreSQL, $profileSQL, ['findReplaceCreateTable' => $replace])
+		: $backup->restore($profileSQL, ['findReplaceCreateTable' => $replace]);
+	if(!$imported) {
 		$errs = method_exists($backup, 'errors') ? implode('; ', (array) $backup->errors()) : 'unknown';
 		repair_fail('SQL import failed: ' . $errs, 500);
+	}
+	// A profile-only import (dev) leaves field_roles / field_permissions empty,
+	// since the profile dump excludes those rows. Inject the version-constant
+	// core access rows, or the restored site denies guests the login process.
+	if($coreSQL === '') {
+		$roleRows = [[40, 37, 0], [41, 37, 0], [41, 38, 2]];
+		$permRows = [
+			[38, 32, 1], [38, 34, 2], [38, 35, 3], [37, 36, 0], [38, 36, 0],
+			[38, 50, 4], [38, 51, 5], [38, 52, 7], [38, 53, 8], [38, 54, 6],
+		];
+		$rStmt = $pdo->prepare("INSERT IGNORE INTO field_roles (pages_id, data, sort) VALUES (?, ?, ?)");
+		foreach($roleRows as $r) $rStmt->execute($r);
+		$pStmt = $pdo->prepare("INSERT IGNORE INTO field_permissions (pages_id, data, sort) VALUES (?, ?, ?)");
+		foreach($permRows as $r) $pStmt->execute($r);
 	}
 } catch(\Throwable $e) {
 	repair_fail('SQL import threw: ' . $e->getMessage(), 500);

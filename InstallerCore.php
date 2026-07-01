@@ -157,8 +157,19 @@ class InstallerCore extends Installer {
 		}
 		$backup = new WireDatabaseBackup();
 		$backup->setDatabase($database);
-		if($backup->restoreMerge($file1, $file2, $restoreOptions)) {
-			$this->ok("Imported database file: $file1");
+
+		// $file1 is the core schema (wire/core/install.sql). On dev builds it
+		// does not exist; $file2 (the profile dump) already builds every table,
+		// so import it alone. findReplaceCreateTable forces the PDO path in both
+		// restore() and restoreMerge(), so engine/charset rewrites apply either way.
+		if($file1 && is_file($file1)) {
+			$ok = $backup->restoreMerge($file1, $file2, $restoreOptions);
+		} else {
+			$ok = $backup->restore($file2, $restoreOptions);
+		}
+
+		if($ok) {
+			if($file1 && is_file($file1)) $this->ok("Imported database file: $file1");
 			$this->ok("Imported database file: $file2");
 		} else {
 			foreach($backup->errors() as $error) $this->alertErr($error);
